@@ -143,6 +143,7 @@ module.exports = NodeHelper.create({
         channels: 1,
         bitDepth: 16,
         sampleRate,
+        device: this.cfg.playbackDevice || "default",
       });
       speaker.on("close", res);
       speaker.end(buffer);
