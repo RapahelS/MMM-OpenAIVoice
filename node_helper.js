@@ -1,30 +1,22 @@
 /**
- * Node-Helper für MMM-OpenAIVoice.
- * Verantwortlich für Wake-Word-Erkennung, Recording,
- * OpenAI-Aufrufe (STT, Chat, TTS) und Audiowiedergabe.
+ * Node-Helper für MMM-OpenAIVoice (mit aplay statt speaker).
  */
 "use strict";
 const NodeHelper = require("node_helper");
 const fs = require("fs");
 const path = require("path");
 const record = require("node-record-lpcm16");
-const Speaker = require("speaker");
+const { spawn } = require("child_process");
 const { Porcupine } = require("@picovoice/porcupine-node");
 require("dotenv").config();
 const OpenAI = require("openai");
 
 module.exports = NodeHelper.create({
-  /** @type {ReturnType<Porcupine['process']>|null} */
   porcupine: null,
-  /** @type {boolean} */
-  busy: false, // Debounce-Flag
-  /** @type {OpenAI|null} */
+  busy: false,
   openai: null,
 
-  /**
-   * Empfängt Initial-Konfiguration vom Frontend.
-   */
-  async socketNotificationReceived(notification, cfg) {
+  socketNotificationReceived(notification, cfg) {
     if (notification !== "OPENAIVOICE_INIT") return;
     this.cfg = cfg;
     this.openai = new OpenAI({
@@ -33,9 +25,6 @@ module.exports = NodeHelper.create({
     this.initWakeWord();
   },
 
-  /**
-   * Wake-Word-Engine starten.
-   */
   initWakeWord() {
     this.porcupine = new Porcupine(
       {
@@ -43,8 +32,9 @@ module.exports = NodeHelper.create({
           process.env.PORCUPINE_ACCESS_KEY || this.cfg.porcupineAccessKey,
         keywordPath: this.cfg.wakeWord,
       },
-      /* onDetection */ () => this.startRecording()
+      () => this.startRecording()
     );
+
     record
       .start({
         sampleRateHertz: 16000,
@@ -55,9 +45,6 @@ module.exports = NodeHelper.create({
       .pipe(this.porcupine);
   },
 
-  /**
-   * Aufnahme starten (Raw PCM ➜ WAV-Datei).
-   */
   startRecording() {
     if (this.busy) return;
     this.busy = true;
@@ -78,19 +65,16 @@ module.exports = NodeHelper.create({
       ws.close();
       this.handleAudio(file).finally(() => {
         fs.unlink(file, () => {});
-        setTimeout(() => (this.busy = false), 300); // Cooldown
+        setTimeout(() => (this.busy = false), 300);
       });
     };
     setTimeout(stop, this.cfg.maxRecordSeconds * 1000);
     rec.on("end", stop);
   },
 
-  /**
-   * Audiofile ➜ STT ➜ Chat ➜ TTS ➜ Playback.
-   */
   async handleAudio(file) {
     try {
-      // 1 STT
+      // 1. Transkription
       const transcription = await this.openai.audio.transcriptions.create({
         file: fs.createReadStream(file),
         model: this.cfg.transcribeModel,
@@ -98,7 +82,7 @@ module.exports = NodeHelper.create({
       });
       this.sendSocketNotification("OPENAIVOICE_TRANSCRIPTION", transcription);
 
-      // 2 Chat
+      // 2. Chat
       const completion = await this.openai.chat.completions.create({
         model: this.cfg.openAiModel,
         messages: [
@@ -111,7 +95,7 @@ module.exports = NodeHelper.create({
       });
       const answer = completion.choices[0].message.content;
 
-      // 3 TTS
+      // 3. TTS
       const speech = await this.openai.audio.speech.create({
         model: this.cfg.ttsModel,
         voice: this.cfg.voice,
@@ -120,11 +104,11 @@ module.exports = NodeHelper.create({
       });
       const audioBuf = Buffer.from(await speech.arrayBuffer());
 
-      // Samplerate aus Header lesen, fallback 24000 Hz
-      const sr = speech.headers.get("x-audio-sample-rate") || 24000;
-      await this.playAudio(audioBuf, Number(sr));
+      // Samplerate aus Header, fallback 24000 Hz
+      const sr = Number(speech.headers.get("x-audio-sample-rate")) || 24000;
+      await this.playAudio(audioBuf);
 
-      // 4 UI-Update
+      // 4. UI-Update
       this.sendSocketNotification("OPENAIVOICE_RESPONSE", answer);
     } catch (err) {
       this.sendSocketNotification("OPENAIVOICE_ERROR", err.message);
@@ -133,20 +117,17 @@ module.exports = NodeHelper.create({
   },
 
   /**
-   * Audio-Buffer auf ALSA ausgeben.
-   * @param {Buffer} buffer
-   * @param {number} sampleRate
+   * Gibt den Puffer via `aplay` auf HDMI/ALSA aus.
+   * @param {Buffer} buffer – WAV-Daten inkl. Header
    */
-  playAudio(buffer, sampleRate) {
-    return new Promise((res) => {
-      const speaker = new Speaker({
-        channels: 1,
-        bitDepth: 16,
-        sampleRate,
-        device: this.cfg.playbackDevice || "default",
-      });
-      speaker.on("close", res);
-      speaker.end(buffer);
+  playAudio(buffer) {
+    return new Promise((resolve, reject) => {
+      const dev = this.cfg.playbackDevice || "default";
+      const p = spawn("aplay", ["-q", "-D", dev, "-t", "wav", "-"]);
+      p.on("close", resolve);
+      p.on("error", reject);
+      p.stdin.write(buffer);
+      p.stdin.end();
     });
   },
 });
