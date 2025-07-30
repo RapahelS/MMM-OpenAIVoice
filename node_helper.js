@@ -1,5 +1,9 @@
 /**
- * Node-Helper für MMM-OpenAIVoice (mit aplay statt speaker).
+ * Node-Helper für MMM-OpenAIVoice
+ *  – Wake-Word via Porcupine
+ *  – Aufnahme via node-record-lpcm16
+ *  – OpenAI STT / Chat / TTS
+ *  – Wiedergabe via aplay
  */
 "use strict";
 const NodeHelper = require("node_helper");
@@ -25,16 +29,26 @@ module.exports = NodeHelper.create({
     this.initWakeWord();
   },
 
+  /**
+   * Wake-Word-Engine initialisieren.
+   */
   initWakeWord() {
+    const accessKey =
+      process.env.PORCUPINE_ACCESS_KEY || this.cfg.porcupineAccessKey;
+
+    // absoluter Pfad zur .ppn-Datei
+    const kwPath = path.isAbsolute(this.cfg.wakeWord)
+      ? this.cfg.wakeWord
+      : path.join(process.cwd(), this.cfg.wakeWord);
+
+    // Porcupine erwartet: (accessKey, [keywordPaths], callback)
     this.porcupine = new Porcupine(
-      {
-        accessKey:
-          process.env.PORCUPINE_ACCESS_KEY || this.cfg.porcupineAccessKey,
-        keywordPath: this.cfg.wakeWord,
-      },
-      () => this.startRecording()
+      accessKey,
+      [kwPath],
+      () => this.startRecording() // Callback bei Erkennung
     );
 
+    // Mikrofon-Stream → Porcupine
     record
       .start({
         sampleRateHertz: 16000,
@@ -45,10 +59,14 @@ module.exports = NodeHelper.create({
       .pipe(this.porcupine);
   },
 
+  /**
+   * Audioaufnahme starten.
+   */
   startRecording() {
     if (this.busy) return;
     this.busy = true;
     const file = path.join(__dirname, "temp.wav");
+
     const rec = record.start({
       endOnSilence: true,
       silence: "1.0",
@@ -57,7 +75,7 @@ module.exports = NodeHelper.create({
       recordProgram: this.cfg.recordProgram,
       device: this.cfg.alsaDevice || undefined,
     });
-    const ws = fs.createWriteStream(file, { encoding: "binary" });
+    const ws = fs.createWriteStream(file);
     rec.pipe(ws);
 
     const stop = () => {
@@ -72,9 +90,12 @@ module.exports = NodeHelper.create({
     rec.on("end", stop);
   },
 
+  /**
+   * STT → Chat → TTS → Wiedergabe + UI-Update
+   */
   async handleAudio(file) {
     try {
-      // 1. Transkription
+      // 1 STT
       const transcription = await this.openai.audio.transcriptions.create({
         file: fs.createReadStream(file),
         model: this.cfg.transcribeModel,
@@ -82,7 +103,7 @@ module.exports = NodeHelper.create({
       });
       this.sendSocketNotification("OPENAIVOICE_TRANSCRIPTION", transcription);
 
-      // 2. Chat
+      // 2 Chat
       const completion = await this.openai.chat.completions.create({
         model: this.cfg.openAiModel,
         messages: [
@@ -95,7 +116,7 @@ module.exports = NodeHelper.create({
       });
       const answer = completion.choices[0].message.content;
 
-      // 3. TTS
+      // 3 TTS
       const speech = await this.openai.audio.speech.create({
         model: this.cfg.ttsModel,
         voice: this.cfg.voice,
@@ -104,11 +125,9 @@ module.exports = NodeHelper.create({
       });
       const audioBuf = Buffer.from(await speech.arrayBuffer());
 
-      // Samplerate aus Header, fallback 24000 Hz
-      const sr = Number(speech.headers.get("x-audio-sample-rate")) || 24000;
       await this.playAudio(audioBuf);
 
-      // 4. UI-Update
+      // 4 Frontend-Update
       this.sendSocketNotification("OPENAIVOICE_RESPONSE", answer);
     } catch (err) {
       this.sendSocketNotification("OPENAIVOICE_ERROR", err.message);
@@ -117,8 +136,7 @@ module.exports = NodeHelper.create({
   },
 
   /**
-   * Gibt den Puffer via `aplay` auf HDMI/ALSA aus.
-   * @param {Buffer} buffer – WAV-Daten inkl. Header
+   * Wiedergabe via ALSA-aplay.
    */
   playAudio(buffer) {
     return new Promise((resolve, reject) => {
