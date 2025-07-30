@@ -1,5 +1,6 @@
 /**
- * Node-Helper für MMM-OpenAIVoice  –  Version mit aplay & korrektem Porcupine-Aufruf
+ * Node-Helper für MMM-OpenAIVoice
+ * (Porcupine: accessKey, keywordPaths, modelPath=null, sensitivities, cb)
  */
 "use strict";
 const NodeHelper = require("node_helper");
@@ -28,18 +29,21 @@ module.exports = NodeHelper.create({
   initWakeWord() {
     const accessKey =
       process.env.PORCUPINE_ACCESS_KEY || this.cfg.porcupineAccessKey;
+
     const kwPath = path.isAbsolute(this.cfg.wakeWord)
       ? this.cfg.wakeWord
       : path.join(process.cwd(), this.cfg.wakeWord);
 
     const keywordPaths = [kwPath];
-    const sensitivities = [0.5]; // 0 → unempfindlich, 1 → sehr empfindlich
+    const modelPath = null; // → Default Raspberry-Pi-Modell verwenden
+    const sensitivities = [0.5]; // 0–1
 
     this.porcupine = new Porcupine(
       accessKey,
       keywordPaths,
+      modelPath,
       sensitivities,
-      () => this.startRecording() // Callback bei Erkennung
+      () => this.startRecording() // Callback bei Wake-Word
     );
 
     record
@@ -81,7 +85,6 @@ module.exports = NodeHelper.create({
   },
 
   async handleAudio(file) {
-    // 1  Transkription
     const transcription = await this.openai.audio.transcriptions.create({
       file: fs.createReadStream(file),
       model: this.cfg.transcribeModel,
@@ -89,7 +92,6 @@ module.exports = NodeHelper.create({
     });
     this.sendSocketNotification("OPENAIVOICE_TRANSCRIPTION", transcription);
 
-    // 2  Chat
     const completion = await this.openai.chat.completions.create({
       model: this.cfg.openAiModel,
       messages: [
@@ -102,21 +104,16 @@ module.exports = NodeHelper.create({
     });
     const answer = completion.choices[0].message.content;
 
-    // 3  TTS
     const speech = await this.openai.audio.speech.create({
       model: this.cfg.ttsModel,
       voice: this.cfg.voice,
       input: answer,
       format: "wav",
     });
-    const audioBuf = Buffer.from(await speech.arrayBuffer());
-    await this.playAudio(audioBuf);
-
-    // 4  UI-Update
+    await this.playAudio(Buffer.from(await speech.arrayBuffer()));
     this.sendSocketNotification("OPENAIVOICE_RESPONSE", answer);
   },
 
-  /** Wiedergabe via aplay */
   playAudio(buffer) {
     return new Promise((resolve, reject) => {
       const dev = this.cfg.playbackDevice || "default";
