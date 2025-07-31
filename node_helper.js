@@ -1,8 +1,7 @@
 "use strict";
 /**
  * Node-Helper für MMM-OpenAIVoice.
- * Enthält Wake-Word-Erkennung (Porcupine), Aufzeichnung (arecord),
- * STT → LLM → TTS Pipeline (OpenAI).
+ * Wake-Word, Aufnahme, STT→LLM→TTS-Pipeline.
  */
 
 const NodeHelper = require("node_helper");
@@ -16,12 +15,11 @@ require("dotenv").config();
 const OpenAI = require("openai");
 
 module.exports = NodeHelper.create({
-  /** @type {Porcupine|null} */
   porcupine: null,
   busy: false,
   openai: null,
 
-  /** Entry-Point – kommt aus Frontend. */
+  // -------------------------------------------------- Init aus Front-End
   socketNotificationReceived(notification, cfg) {
     if (notification !== "OPENAIVOICE_INIT") return;
     this.cfg = cfg;
@@ -31,29 +29,42 @@ module.exports = NodeHelper.create({
     this.initWakeWord();
   },
 
-  /** Initialisiert Wake-Word-Engine. */
+  // -------------------------------------------------- Wake-Word-Initialisierung
   initWakeWord() {
     const accessKey =
       process.env.PORCUPINE_ACCESS_KEY || this.cfg.porcupineAccessKey;
 
-    // Absoluter Pfad, damit Porcupine ihn sicher findet
+    /*
+     * Pfad-Auflösung:
+     *   – absoluter Pfad bleibt unverändert
+     *   – sonst relativ zum MagicMirror-Haupt­verzeichnis (process.cwd())
+     *     → vermeidet Dopplungen wie “…MMM-OpenAIVoice/modules/MMM-OpenAIVoice/…”
+     */
     const kwPath = path.isAbsolute(this.cfg.wakeWord)
       ? this.cfg.wakeWord
-      : path.join(__dirname, this.cfg.wakeWord);
+      : path.resolve(process.cwd(), this.cfg.wakeWord);
 
-    // Reihenfolge: accessKey, keywordPaths, sensitivities, modelPath?
+    if (!fs.existsSync(kwPath)) {
+      this.sendSocketNotification(
+        "OPENAIVOICE_ERROR",
+        `Wake-Word-Datei nicht gefunden: ${kwPath}`
+      );
+      return; // früh abbrechen, sonst crasht Porcupine
+    }
+
+    // Porcupine – Parameter­folge laut Node-API :contentReference[oaicite:0]{index=0}
     this.porcupine = new Porcupine(
       accessKey,
       [kwPath],
-      [0.5],
-      null // deutsches Standard-Raspberry-Model
-    ); // :contentReference[oaicite:3]{index=3}
+      [0.5], // Sensitivität
+      null, // modelPath (Standard-Raspberry-Pi)
+      null // libraryPath (Standard)
+    );
 
-    // Transform-Stream, der 16-bit-PCM-Frames weiterleitet.
+    /* Transform-Stream leitet PCM-Frames an Porcupine */
     const porcupineStream = new Transform({
       readableObjectMode: true,
       transform: (chunk, _enc, cb) => {
-        // chunk = <Buffer ...> ; Länge == frameLength*2
         const keywordIndex = this.porcupine.process(chunk);
         if (keywordIndex >= 0) this.startRecording();
         cb(null, chunk);
@@ -67,10 +78,10 @@ module.exports = NodeHelper.create({
         recordProgram: this.cfg.recordProgram,
         device: this.cfg.alsaDevice ?? undefined,
       })
-      .pipe(porcupineStream); // kein .pipe(this.porcupine) mehr
+      .pipe(porcupineStream);
   },
 
-  /** Startet Benutzer-Aufnahme nach Wake-Word. */
+  // -------------------------------------------------- Aufnahme
   startRecording() {
     if (this.busy) return;
     this.busy = true;
@@ -103,9 +114,9 @@ module.exports = NodeHelper.create({
     rec.once("end", finalize);
   },
 
-  /** Führt STT → LLM → TTS Pipeline aus. */
+  // -------------------------------------------------- STT → LLM → TTS
   async handleAudio(file) {
-    // ---------- Speech-to-Text ----------
+    // --- Speech-to-Text
     let transcript;
     try {
       transcript = await this.openai.audio.transcriptions.create({
@@ -114,15 +125,14 @@ module.exports = NodeHelper.create({
         response_format: "text",
       });
     } catch {
-      // proprietäres Modell evtl. nicht freigeschaltet → Whisper-Fallback
       transcript = await this.openai.audio.transcriptions.create({
         file: fs.createReadStream(file),
-        model: "whisper-1", // :contentReference[oaicite:4]{index=4}
+        model: "whisper-1", // Fallback
       });
     }
     this.sendSocketNotification("OPENAIVOICE_TRANSCRIPTION", transcript);
 
-    // ---------- Chat-Completion ----------
+    // --- Chat-Completion
     const completion = await this.openai.chat.completions.create({
       model: this.cfg.openAiModel,
       messages: [
@@ -135,7 +145,7 @@ module.exports = NodeHelper.create({
     });
     const answer = completion.choices[0].message.content;
 
-    // ---------- Text-to-Speech ----------
+    // --- Text-to-Speech
     let speech;
     try {
       speech = await this.openai.audio.speech.create({
@@ -146,7 +156,7 @@ module.exports = NodeHelper.create({
       });
     } catch {
       speech = await this.openai.audio.speech.create({
-        model: "tts-1", // :contentReference[oaicite:5]{index=5}
+        model: "tts-1", // Fallback
         voice: this.cfg.voice,
         input: answer,
         format: "wav",
@@ -157,7 +167,7 @@ module.exports = NodeHelper.create({
     this.sendSocketNotification("OPENAIVOICE_RESPONSE", answer);
   },
 
-  /** Spielt WAV-Buffer über ALSA-Device ab. */
+  // -------------------------------------------------- Wiedergabe
   playAudio(buffer) {
     return new Promise((resolve, reject) => {
       const dev = this.cfg.playbackDevice || "default";
