@@ -1,8 +1,5 @@
 "use strict";
-/**
- * Node-Helper: STT → LLM → TTS.
- * Erwartet WAV-Pfad aus MMM-Hotword2.
- */
+/** Node-Helper: WAV-→ STT → Responses-Streaming → TTS-Streaming → Playback. */
 
 const NodeHelper = require("node_helper");
 const fs = require("fs");
@@ -10,101 +7,104 @@ const { spawn } = require("child_process");
 const OpenAI = require("openai");
 require("dotenv").config();
 
-module.exports = NodeHelper.create({
-  busy: false,
-  openai: null,
-  cfg: {},
+const SENT_END = /[.!?]\s$/; // einfacher Satztrenner
 
-  /** Init von Front-End. */
-  socketNotificationReceived(notification, payload) {
-    if (notification === "OPENAIVOICE_INIT") {
+module.exports = NodeHelper.create({
+  init() {
+    this.conv = [];
+    this.lastTs = 0;
+  },
+
+  socketNotificationReceived(type, payload) {
+    if (type === "OPENAIVOICE_INIT") {
       this.cfg = payload;
-      /* Umgebungsvariable schlägt Konfig-Key. */
       this.openai = new OpenAI({
         apiKey: process.env.OPENAI_API_KEY || this.cfg.openAiKey,
       });
       return;
     }
+    if (type === "OPENAIVOICE_AUDIO")
+      this.handleAudio(payload.filePath).catch((e) => this.error(e));
+  },
 
-    if (notification === "OPENAIVOICE_AUDIO" && payload?.filePath) {
-      if (this.busy) {
-        this.sendSocketNotification(
-          "OPENAIVOICE_ERROR",
-          "Assistent beschäftigt – bitte kurz warten."
-        );
-        return;
+  /* ---------- Pipeline ---------- */
+  async handleAudio(wavPath) {
+    /* 1 STT */
+    const transcript = await this.stt(wavPath);
+    this.send("USER", transcript);
+    this.conv.push({ role: "user", content: transcript });
+
+    /* 2 Responses-Streaming */
+    const textStream = await this.openai.responses.create({
+      model: this.cfg.model,
+      input: this.conv,
+      previous_response_id: this.prevId ?? undefined,
+      stream: true,
+      store: false,
+    });
+
+    /* Sammeln + Parallel-TTS */
+    let buffer = "";
+    for await (const evt of textStream) {
+      if (evt.type !== "message") continue;
+      const delta = evt.content[0].text;
+      buffer += delta;
+      if (SENT_END.test(buffer)) {
+        await this.say(buffer.trim());
+        buffer = "";
       }
-      this.busy = true;
-      this.handleAudio(payload.filePath)
-        .catch((err) =>
-          this.sendSocketNotification("OPENAIVOICE_ERROR", String(err))
-        )
-        .finally(() => (this.busy = false));
+      this.prevId = evt.id; // für Multiturn-Kontext
     }
+    if (buffer) await this.say(buffer.trim());
+    this.lastTs = Date.now();
   },
 
-  // ---------- Haupt-Pipeline ----------
-  async handleAudio(file) {
-    // --- Speech-to-Text
-    let transcript;
-    try {
-      transcript = await this.openai.audio.transcriptions.create({
-        file: fs.createReadStream(file),
-        model: this.cfg.transcribeModel,
-        response_format: "text",
-      });
-    } catch {
-      transcript = await this.openai.audio.transcriptions.create({
-        file: fs.createReadStream(file),
-        model: "whisper-1",
-      });
-    }
-    this.sendSocketNotification("OPENAIVOICE_TRANSCRIPTION", transcript);
-
-    // --- Chat-Completion
-    const completion = await this.openai.chat.completions.create({
-      model: this.cfg.openAiModel,
-      messages: [
-        {
-          role: "system",
-          content:
-            "Du bist ein hilfreich-knapper Spiegel-Assistent und antwortest in natürlichem Deutsch.",
-        },
-        { role: "user", content: transcript },
-      ],
+  /* ---------- Einzel-Bausteine ---------- */
+  async stt(path) {
+    const res = await this.openai.audio.transcriptions.create({
+      file: fs.createReadStream(path),
+      model: "gpt-4o-mini-transcribe",
+      response_format: "text",
     });
-    const answer = completion.choices[0].message.content;
-
-    // --- Text-to-Speech
-    let speech;
-    try {
-      speech = await this.openai.audio.speech.create({
-        model: this.cfg.ttsModel,
-        voice: this.cfg.voice,
-        input: answer,
-        format: "wav",
-      });
-    } catch {
-      speech = await this.openai.audio.speech.create({
-        model: "tts-1",
-        voice: this.cfg.voice,
-        input: answer,
-        format: "wav",
-      });
-    }
-
-    await this.playAudio(Buffer.from(await speech.arrayBuffer()));
-    this.sendSocketNotification("OPENAIVOICE_RESPONSE", answer);
+    return res.trim();
   },
 
-  // ---------- Wiedergabe ----------
-  playAudio(buffer) {
-    return new Promise((resolve, reject) => {
-      const dev = this.cfg.playbackDevice || "default";
-      const p = spawn("aplay", ["-q", "-D", dev, "-t", "wav", "-"]);
-      p.on("close", resolve);
-      p.on("error", reject);
-      p.stdin.end(buffer);
+  async say(text) {
+    /* push in Konversation */
+    this.conv.push({ role: "assistant", content: text });
+
+    /* TTS – 24 kHz PCM */
+    const speech = await this.openai.audio.speech.create({
+      model: this.cfg.ttsModel,
+      voice: this.cfg.voice,
+      input: text,
+      response_format: "wav",
     });
+    const wav = Buffer.from(await speech.arrayBuffer());
+
+    /* asynchron abspielen, GUI-Text sofort schicken */
+    this.send("BOT", text);
+    await this.play(wav);
+  },
+
+  play(buf) {
+    return new Promise((res, rej) => {
+      const dev = this.cfg.playbackDevice;
+      const p = spawn(
+        "aplay",
+        ["-q", "-D", dev, "-f", "S16_LE", "-c", "1", "-r", "24000", "-"],
+        { stdio: ["pipe", "ignore", "ignore"] }
+      );
+      p.on("close", res).on("error", rej);
+      p.stdin.end(buf);
+    });
+  },
+
+  send(tag, txt) {
+    this.sendSocketNotification(`OPENAIVOICE_${tag}`, txt);
+  },
+  error(e) {
+    this.send("ERR", e.message);
+    console.error(e);
   },
 });
