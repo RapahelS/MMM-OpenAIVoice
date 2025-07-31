@@ -1,61 +1,51 @@
-/* global Module, Log */
+/* eslint-env browser */
+/**
+ * MagicMirror-Modul: OpenAI-Voice-Assistant.
+ * Ultrakurze Google-Style-Docstrings, PEP 8-ähnliche Namenskonvention für Konsistenz.
+ * @module MMM-OpenAIVoice
+ */
+
 Module.register("MMM-OpenAIVoice", {
   // ---------- Standard-Konfiguration ----------
   defaults: {
     wakeWord: "assets/Hey-Spiegel_de_raspberry-pi_v3_0_0.ppn",
     porcupineAccessKey: "",
-    openAiKey: "", // leer: fällt auf process.env zurück
+    openAiKey: "",
     openAiModel: "gpt-4o-mini",
-    transcribeModel: "gpt-4o-mini-transcribe",
-    ttsModel: "gpt-4o-mini-tts",
+    transcribeModel: "gpt-4o-mini-transcribe", // Fallback siehe helper
+    ttsModel: "gpt-4o-mini-tts", // Fallback siehe helper
     voice: "alloy",
     maxRecordSeconds: 10,
     recordProgram: "arecord",
-    alsaDevice: null, // z. B. "plughw:1,0"
+    alsaDevice: null,
   },
 
-  /**
-   * CSS laden.
-   * @returns {string[]} – Pfade zu CSS-Dateien
-   */
+  /** Liefert Modul-CSS. */
   getStyles() {
     return ["MMM-OpenAIVoice.css"];
   },
 
-  /**
-   * Modul initialisieren.
-   */
+  /** Initialisiert das Modul. */
   start() {
     this.conversation = [];
-    // UI sofort initialisieren
-    this.updateDom();
-    // Node-Helper starten
+    this.updateDom(); // UI sofort
     this.sendSocketNotification("OPENAIVOICE_INIT", this.config);
   },
 
-  /**
-   * Socket-Nachrichten vom Node-Helper verarbeiten.
-   */
+  /** Verarbeitet Nachrichten vom Node-Helper. */
   socketNotificationReceived(notification, payload) {
-    switch (notification) {
-      case "OPENAIVOICE_TRANSCRIPTION":
-        this.addChat("👤", payload);
-        break;
-      case "OPENAIVOICE_RESPONSE":
-        this.addChat("🤖", payload);
-        break;
-      case "OPENAIVOICE_ERROR":
-        this.addChat("⚠️", payload);
-        break;
-      default:
-      // ignore
-    }
+    const map = {
+      OPENAIVOICE_TRANSCRIPTION: "👤",
+      OPENAIVOICE_RESPONSE: "🤖",
+      OPENAIVOICE_ERROR: "⚠️",
+    };
+    if (map[notification]) this.addChat(map[notification], payload);
   },
 
   /**
-   * Fügt eine Zeile zur Konversationsansicht hinzu.
-   * @param {string} speaker – Icon
-   * @param {string} text    – Inhalt
+   * Fügt neue Chatzeile hinzu.
+   * @param {string} speaker Emoji/Icon.
+   * @param {string} text    Inhalt.
    */
   addChat(speaker, text) {
     this.conversation.push({ speaker, text });
@@ -63,21 +53,18 @@ Module.register("MMM-OpenAIVoice", {
     this.updateDom();
   },
 
-  /**
-   * DOM erzeugen.
-   * @returns {HTMLElement}
-   */
+  /** Baut DOM-Baum. */
   getDom() {
-    const wrapper = document.createElement("div");
-    if (this.conversation.length === 0) {
-      wrapper.innerHTML = "Sag „Hey&nbsp;Mirror…“";
-      return wrapper;
+    const w = document.createElement("div");
+    if (!this.conversation.length) {
+      w.innerHTML = "Sag „Hey&nbsp;Mirror…“";
+      return w;
     }
-    this.conversation.forEach(({ speaker, text }) => {
+    for (const { speaker, text } of this.conversation) {
       const line = document.createElement("div");
       line.innerHTML = `<strong>${speaker}</strong>&nbsp;${text}`;
-      wrapper.appendChild(line);
-    });
-    return wrapper;
+      w.appendChild(line);
+    }
+    return w;
   },
 });
