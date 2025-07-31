@@ -36,7 +36,7 @@ Module.register("MMM-OpenAIVoice", {
   getDom() {
     const w = document.createElement("div");
     if (!this.chat.length) {
-      w.innerHTML = "Sag „Hey&nbsp;Mirror…“";
+      w.innerHTML = "Sag „&nbsp;Computer…“";
       return w;
     }
     this.chat.forEach(({ tag, txt }) => {

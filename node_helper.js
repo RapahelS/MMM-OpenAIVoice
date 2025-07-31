@@ -1,13 +1,11 @@
 "use strict";
-/** Node-Helper: WAV-→ STT → Responses-Streaming → TTS-Streaming → Playback. */
-
 const NodeHelper = require("node_helper");
 const fs = require("fs");
 const { spawn } = require("child_process");
 const OpenAI = require("openai");
 require("dotenv").config();
 
-const SENT_END = /[.!?]\s$/; // einfacher Satztrenner
+const SENT_END = /[.!?]\s$/;
 
 module.exports = NodeHelper.create({
   init() {
@@ -15,96 +13,111 @@ module.exports = NodeHelper.create({
     this.lastTs = 0;
   },
 
+  /* --------------------- Nachrichten --------------------- */
   socketNotificationReceived(type, payload) {
     if (type === "OPENAIVOICE_INIT") {
       this.cfg = payload;
+      this.debug = Boolean(this.cfg.debug);
       this.openai = new OpenAI({
         apiKey: process.env.OPENAI_API_KEY || this.cfg.openAiKey,
       });
       return;
     }
     if (type === "OPENAIVOICE_AUDIO")
-      this.handleAudio(payload.filePath).catch((e) => this.error(e));
+      this.handleAudio(payload.filePath).catch((err) => this.error(err));
   },
 
-  /* ---------- Pipeline ---------- */
+  /* ----------------------- Pipeline ---------------------- */
   async handleAudio(wavPath) {
-    /* 1 STT */
-    const transcript = await this.stt(wavPath);
-    this.send("USER", transcript);
-    this.conv.push({ role: "user", content: transcript });
+    try {
+      const transcript = await this.stt(wavPath);
+      this.send("USER", transcript);
+      this.conv.push({ role: "user", content: transcript });
 
-    /* 2 Responses-Streaming */
-    const textStream = await this.openai.responses.create({
-      model: this.cfg.model,
-      input: this.conv,
-      previous_response_id: this.prevId ?? undefined,
-      stream: true,
-      store: false,
-    });
+      const stream = await this.openai.responses.create({
+        model: this.cfg.model, // ✅ jetzt vorhanden
+        input: this.conv,
+        previous_response_id: this.prevId ?? undefined,
+        stream: true,
+        store: false,
+      });
 
-    /* Sammeln + Parallel-TTS */
-    let buffer = "";
-    for await (const evt of textStream) {
-      if (evt.type !== "message") continue;
-      const delta = evt.content[0].text;
-      buffer += delta;
-      if (SENT_END.test(buffer)) {
-        await this.say(buffer.trim());
-        buffer = "";
+      let buf = "";
+      for await (const evt of stream) {
+        if (evt.type !== "message") continue;
+        const delta = evt.content[0].text;
+        buf += delta;
+        if (SENT_END.test(buf)) {
+          await this.say(buf.trim());
+          buf = "";
+        }
+        this.prevId = evt.id;
       }
-      this.prevId = evt.id; // für Multiturn-Kontext
+      if (buf) await this.say(buf.trim());
+    } catch (err) {
+      this.error(err);
     }
-    if (buffer) await this.say(buffer.trim());
-    this.lastTs = Date.now();
   },
 
-  /* ---------- Einzel-Bausteine ---------- */
+  /* -------------------- Hilfsfunktionen ------------------ */
   async stt(path) {
-    const res = await this.openai.audio.transcriptions.create({
+    const t0 = Date.now();
+    const text = await this.openai.audio.transcriptions.create({
       file: fs.createReadStream(path),
       model: "gpt-4o-mini-transcribe",
       response_format: "text",
     });
-    return res.trim();
+    this.log("STT  ⏱", Date.now() - t0, "ms:", text.trim());
+    return text.trim();
   },
 
   async say(text) {
-    /* push in Konversation */
     this.conv.push({ role: "assistant", content: text });
+    this.send("BOT", text);
 
-    /* TTS – 24 kHz PCM */
+    const t0 = Date.now();
     const speech = await this.openai.audio.speech.create({
       model: this.cfg.ttsModel,
       voice: this.cfg.voice,
       input: text,
-      response_format: "wav",
+      response_format: "wav", // ALTERNATIV: "pcm" für -20 % Latenz
     });
     const wav = Buffer.from(await speech.arrayBuffer());
+    this.log("TTS  ⏱", Date.now() - t0, "ms · bytes", wav.length);
 
-    /* asynchron abspielen, GUI-Text sofort schicken */
-    this.send("BOT", text);
     await this.play(wav);
   },
 
   play(buf) {
     return new Promise((res, rej) => {
-      const dev = this.cfg.playbackDevice;
-      const p = spawn(
-        "aplay",
-        ["-q", "-D", dev, "-f", "S16_LE", "-c", "1", "-r", "24000", "-"],
-        { stdio: ["pipe", "ignore", "ignore"] }
-      );
+      const args = [
+        "-q",
+        "-D",
+        this.cfg.playbackDevice || "default",
+        "-f",
+        "S16_LE",
+        "-c",
+        "1",
+        "-r",
+        "24000",
+        "-t",
+        "wav", // bei "pcm" hier "raw"
+      ];
+      const p = spawn("aplay", args);
       p.on("close", res).on("error", rej);
       p.stdin.end(buf);
     });
   },
 
+  /* ----------------------- Utils ------------------------- */
   send(tag, txt) {
     this.sendSocketNotification(`OPENAIVOICE_${tag}`, txt);
   },
+  log(...a) {
+    if (this.debug) console.log("[OpenAIVoice]", ...a);
+  },
   error(e) {
-    this.send("ERR", e.message);
     console.error(e);
+    this.send("ERR", e.message);
   },
 });
