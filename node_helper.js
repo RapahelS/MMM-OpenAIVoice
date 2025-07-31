@@ -53,13 +53,7 @@ module.exports = NodeHelper.create({
     }
 
     // Porcupine – Parameter­folge laut Node-API :contentReference[oaicite:0]{index=0}
-    this.porcupine = new Porcupine(
-      accessKey,
-      [kwPath],
-      [0.5], // Sensitivität
-      null, // modelPath (Standard-Raspberry-Pi)
-      null // libraryPath (Standard)
-    );
+    this.porcupine = new Porcupine(accessKey, [kwPath], [0.5]);
 
     /* Transform-Stream leitet PCM-Frames an Porcupine */
     const porcupineStream = new Transform({
