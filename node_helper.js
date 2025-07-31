@@ -89,6 +89,8 @@ module.exports = NodeHelper.create({
     try {
       const response = await this.openai.responses.create({
         model: this.cfg.model,
+        instructions:
+          "Du bist ein lustiger Assistant der Hinter dem Spiegel im Bad sitzt und hilfst. Halte dich kurz und witzig.",
         input: userText,
         previous_response_id: this.previousResponseId,
         tools: [{ type: "web_search" }],
@@ -124,6 +126,8 @@ module.exports = NodeHelper.create({
         model: this.cfg.ttsModel,
         voice: this.cfg.voice,
         input: text,
+        instructions:
+          "Spreche in einem positiven, freundlichen und lustigen Ton",
         response_format: "pcm",
       });
       const audioBuffer = Buffer.from(await speech.arrayBuffer());
