@@ -1,4 +1,3 @@
-// node_helper.js – Finale, korrigierte Version
 "use strict";
 
 const NodeHelper = require("node_helper");
@@ -6,17 +5,13 @@ const fs = require("fs");
 const { spawn } = require("child_process");
 const OpenAI = require("openai");
 
-const SENTENCE_END_REGEX = /[.!?]\s|[\n\r]/;
-
 module.exports = NodeHelper.create({
-  // init() und socketNotificationReceived() bleiben unverändert
   init() {
-    this.conv = [];
-    this.prevId = undefined;
-    this.lastInteractionTimestamp = 0;
-    this.isProcessing = false;
     this.cfg = {};
     this.openai = null;
+    this.isProcessing = false;
+    this.conversation = [];
+    this.conversationTimeout = null;
   },
 
   socketNotificationReceived(type, payload) {
@@ -24,49 +19,56 @@ module.exports = NodeHelper.create({
       this.cfg = payload;
       this.debug = !!this.cfg.debug;
       if (!this.cfg.openAiKey) {
-        this.error("OpenAI API Key ist nicht in der config.js gesetzt!");
-        return;
+        return this.error("OpenAI API Key ist nicht in der config.js gesetzt!");
       }
       try {
         this.openai = new OpenAI({ apiKey: this.cfg.openAiKey });
-        this.log("Initialisierung erfolgreich. Modell:", this.cfg.model);
+        this.log("Initialisierung erfolgreich.");
       } catch (e) {
         this.error("OpenAI-Initialisierung fehlgeschlagen:", e.message);
       }
       return;
     }
+
     if (type === "OPENAIVOICE_PROCESS_AUDIO" && payload?.filePath) {
       if (this.isProcessing) {
-        this.log(
-          "Ignoriere Audio, da bereits eine Anfrage in Bearbeitung ist."
-        );
-        return;
+        return this.log("Ignoriere Audio, Anfrage läuft bereits.");
       }
       this.isProcessing = true;
+      this.stopConversationTimeout();
       this.handleAudioPipeline(payload.filePath).finally(() => {
         this.isProcessing = false;
-        this.lastInteractionTimestamp = Date.now();
       });
     }
   },
 
-  // handleAudioPipeline() und speechToText() bleiben unverändert
   async handleAudioPipeline(wavPath) {
     try {
-      if (Date.now() - this.lastInteractionTimestamp > this.cfg.silenceMs) {
-        this.log("Stille-Timeout erreicht, setze Konversation zurück.");
-        this.conv = [];
-        this.prevId = undefined;
-      }
       const userText = await this.speechToText(wavPath);
       if (!userText) {
-        this.log("Kein Text erkannt.");
+        this.log("Kein Text erkannt, starte Konversations-Loop neu.");
+        this.startConversationLoop();
         return;
       }
+
       this.send("USER_TRANSCRIPTION", userText);
-      await this.processLlmAndTtsStream(userText);
+      this.conversation.push({ role: "user", content: userText });
+
+      const botResponseText = await this.getBotResponse();
+      if (!botResponseText) {
+        this.log("Keine Antwort vom Bot erhalten.");
+        this.startConversationLoop();
+        return;
+      }
+
+      this.conversation.push({ role: "assistant", content: botResponseText });
+      this.send("BOT_CHUNK", botResponseText);
+
+      await this.playTextAsSpeech(botResponseText);
+      this.startConversationLoop();
     } catch (err) {
-      this.error(err.message || "Ein unbekannter Fehler ist aufgetreten.");
+      this.error(err.message || "Unbekannter Fehler in der Pipeline.");
+      this.endConversation();
     } finally {
       fs.unlink(
         wavPath,
@@ -82,10 +84,7 @@ module.exports = NodeHelper.create({
         file: fs.createReadStream(path),
         model: this.cfg.transcribeModel,
       });
-      this.log(
-        `STT (${this.cfg.transcribeModel}) ⏱ ${Date.now() - t0} ms →`,
-        text.trim()
-      );
+      this.log(`STT ⏱ ${Date.now() - t0} ms →`, text.trim());
       return text.trim();
     } catch (e) {
       this.error(`STT Fehler: ${e.message}`);
@@ -93,100 +92,93 @@ module.exports = NodeHelper.create({
     }
   },
 
-  // KORRIGIERTE FUNKTION
-  async processLlmAndTtsStream(userText) {
-    this.send("BOT_START");
-    const player = this.createAudioPlayer();
-    let sentenceBuffer = "";
-    let fullResponseText = ""; // FIX 1: Variable zum Sammeln der Antwort
-
+  async getBotResponse() {
+    this.log(
+      `Frage an OpenAI mit ${this.conversation.length} Nachrichten im Kontext...`
+    );
     try {
-      const stream = await this.openai.responses.create({
+      const response = await this.openai.chat.completions.create({
         model: this.cfg.model,
-        input: userText,
-        previous_response_id: this.prevId,
-        stream: true,
+        messages: this.conversation,
       });
-
-      this.log("Pipeline gestartet mit Responses-API.");
-
-      for await (const event of stream) {
-        if (event.type === "content.delta") {
-          const delta = event.content[0].text;
-          if (!delta) continue;
-
-          fullResponseText += delta; // FIX 1: Antwort hier zusammensetzen
-          this.send("BOT_CHUNK", delta);
-          sentenceBuffer += delta;
-
-          if (SENTENCE_END_REGEX.test(sentenceBuffer)) {
-            await this.streamTextToPlayer(sentenceBuffer.trim(), player);
-            sentenceBuffer = "";
-          }
-        }
-        if (event.type === "response") {
-          this.prevId = event.response.id;
-        }
-      }
-
-      if (sentenceBuffer.trim()) {
-        await this.streamTextToPlayer(sentenceBuffer.trim(), player);
-      }
-
-      // FIX 1: Die selbst zusammengesetzte Antwort für den Kontext verwenden
-      this.conv.push({ role: "user", content: userText });
-      this.conv.push({ role: "assistant", content: fullResponseText });
+      const text = response.choices[0].message.content;
+      this.log("Antwort erhalten:", text.trim());
+      return text.trim();
     } catch (e) {
-      this.error(`LLM/TTS Stream Fehler: ${e.message}`);
-      await this.streamTextToPlayer(
-        "Entschuldigung, ein Fehler ist aufgetreten.",
-        player
-      );
-    } finally {
-      player.stdin.end();
-      this.send("BOT_END");
-      this.log("Pipeline beendet.");
+      this.error(`Fehler bei der Anfrage an die OpenAI API: ${e.message}`);
+      return "Entschuldigung, ich habe gerade ein technisches Problem.";
     }
   },
 
-  // KORRIGIERTE FUNKTION
-  async streamTextToPlayer(text, player) {
+  async playTextAsSpeech(text) {
     if (!text) return;
-    this.log(`Spreche Satz: "${text}"`);
+    this.log(`Spiele Audio für: "${text}"`);
     try {
-      const ttsStream = await this.openai.audio.speech.create({
+      const speech = await this.openai.audio.speech.create({
         model: this.cfg.ttsModel,
         voice: this.cfg.voice,
         input: text,
-        // FIX 2: Korrektes, von der API unterstütztes Format verwenden
         response_format: "pcm",
       });
-      ttsStream.body.pipe(player.stdin, { end: false });
-      await new Promise((resolve) => ttsStream.body.on("end", resolve));
+      const audioBuffer = Buffer.from(await speech.arrayBuffer());
+      await this.playAudioBuffer(audioBuffer);
     } catch (e) {
-      this.error(`TTS Fehler für Text "${text}": ${e.message}`);
+      this.error(`Fehler bei der TTS-Erstellung: ${e.message}`);
     }
   },
 
-  // createAudioPlayer() und Utils bleiben unverändert
-  createAudioPlayer() {
-    const args = [
-      "-q",
-      "-D",
-      this.cfg.playbackDevice,
-      "-t",
-      "raw",
-      "-f",
-      "S16_LE",
-      "-r",
-      "24000",
-      "-c",
-      "1",
-    ];
-    const player = spawn("aplay", args);
-    player.on("error", (err) => this.error("aplay Fehler:", err.message));
-    player.stderr.on("data", (data) => this.error(`aplay stderr: ${data}`));
-    return player;
+  playAudioBuffer(buffer) {
+    return new Promise((resolve, reject) => {
+      const player = spawn("aplay", [
+        "-q",
+        "-D",
+        this.cfg.playbackDevice,
+        "-t",
+        "raw",
+        "-f",
+        "S16_LE",
+        "-r",
+        "24000",
+        "-c",
+        "1",
+      ]);
+      player.on("close", resolve);
+      player.on("error", (err) => {
+        this.error(`aplay Fehler: ${err.message}`);
+        reject(err);
+      });
+      player.stdin.end(buffer);
+    });
+  },
+
+  startConversationLoop() {
+    this.log("Aktiviere Mikrofon für die nächste Runde...");
+    this.sendNotification("HOTWORD_ACTIVATE", { asDetected: "COMPUTER" });
+    this.startConversationTimeout();
+  },
+
+  startConversationTimeout() {
+    this.stopConversationTimeout();
+    this.log(
+      `Konversation wird in ${
+        this.cfg.silenceMs / 1000
+      }s beendet, wenn nichts gesagt wird.`
+    );
+    this.conversationTimeout = setTimeout(() => {
+      this.endConversation();
+    }, this.cfg.silenceMs);
+  },
+
+  stopConversationTimeout() {
+    if (this.conversationTimeout) clearTimeout(this.conversationTimeout);
+    this.conversationTimeout = null;
+  },
+
+  endConversation() {
+    this.log("Konversation beendet. Warte auf neues Weckwort.");
+    this.sendNotification("HOTWORD_DEACTIVATE");
+    this.conversation = [];
+    this.send("CONVERSATION_END");
   },
 
   send(tag, txt) {

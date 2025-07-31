@@ -1,15 +1,11 @@
 /* eslint-env browser */
 /**
- * MMM-OpenAIVoice - Frontend (Final)
- *
- * - Empfängt die Trigger-Benachrichtigung von MMM-Hotword2.
- * - Sendet den Dateipfad zur Verarbeitung an den Node Helper.
- * - Stellt die transkribierte Nutzer-Eingabe dar.
- * - Zeigt die Antwort des Bots flüssig an, indem es Text-Chunks verarbeitet.
+ * MMM-OpenAIVoice - Frontend (Final, Robust)
+ * - Zeigt die Konversation auf dem Bildschirm an.
  */
 Module.register("MMM-OpenAIVoice", {
   defaults: {
-    openAiKey: "", // Wird vom Helper benötigt
+    openAiKey: "",
     model: "gpt-4o-mini",
     ttsModel: "gpt-4o-mini-tts",
     transcribeModel: "gpt-4o-mini-transcribe",
@@ -19,54 +15,42 @@ Module.register("MMM-OpenAIVoice", {
     debug: false,
   },
 
-  getStyles() {
-    return ["MMM-OpenAIVoice.css"];
-  },
+  getStyles: () => ["MMM-OpenAIVoice.css"],
 
   start() {
-    this.currentBotResponseElement = null;
     this.sendSocketNotification("OPENAIVOICE_INIT", this.config);
     this.updateDom(0);
   },
 
-  // Empfängt die Benachrichtigung von MMM-Hotword2
   notificationReceived(notification, payload) {
     if (notification === "OPENAIVOICE_AUDIO") {
-      const container = document.querySelector(".MMM-OpenAIVoice");
-      if (container) container.classList.remove("recording");
-
-      // Sendet die Benachrichtigung mit dem korrekten Namen an den Node Helper
       this.sendSocketNotification("OPENAIVOICE_PROCESS_AUDIO", payload);
     }
-
     if (notification === "OPENAIVOICE_ERROR") {
       this.socketNotificationReceived("OPENAIVOICE_ERROR", payload);
     }
   },
 
-  // Empfängt Nachrichten vom Node Helper
   socketNotificationReceived(notification, payload) {
+    const chatContainer = document.getElementById("openaivoice-chat");
+    if (!chatContainer) return;
+
     switch (notification) {
       case "OPENAIVOICE_USER_TRANSCRIPTION":
-        // Bereinigt die UI für eine neue Konversation
-        const chatContainer = document.getElementById("openaivoice-chat");
-        if (chatContainer) chatContainer.innerHTML = "";
+        // Bei der ersten Nutzer-Eingabe nach dem Weckwort, die UI leeren.
+        if (!this.conversationStarted) {
+          chatContainer.innerHTML = "";
+          this.conversationStarted = true;
+        }
         this.addMessage("👤", payload);
         break;
-      case "OPENAIVOICE_BOT_START":
-        this.currentBotResponseElement = this.addMessage("🤖", "");
+      case "OPENAIVOICE_BOT_CHUNK": // Empfängt jetzt die ganze Nachricht
+        this.addMessage("🤖", payload);
         break;
-      case "OPENAIVOICE_BOT_CHUNK":
-        if (this.currentBotResponseElement) {
-          // Ersetzt Zeilenumbrüche durch HTML-Tags für die korrekte Anzeige
-          this.currentBotResponseElement.innerHTML += payload.replace(
-            /\n/g,
-            "<br>"
-          );
-        }
-        break;
-      case "OPENAIVOICE_BOT_END":
-        this.currentBotResponseElement = null; // Antwort ist fertig
+      case "OPENAIVOICE_CONVERSATION_END":
+        this.conversationStarted = false;
+        // Optional eine Nachricht anzeigen, dass die Konversation beendet ist.
+        chatContainer.innerHTML = "Sag „Computer…“";
         break;
       case "OPENAIVOICE_ERROR":
         this.addMessage("⚠️", payload);
@@ -74,50 +58,25 @@ Module.register("MMM-OpenAIVoice", {
     }
   },
 
-  // Fügt eine neue Nachricht zum Chat-Fenster hinzu
   addMessage(tag, text) {
     const chatContainer = document.getElementById("openaivoice-chat");
-    if (!chatContainer) return null;
-
-    // UI-Logik, um nicht unendlich viele Nachrichten anzuzeigen
-    while (chatContainer.children.length > 10) {
-      chatContainer.removeChild(chatContainer.firstChild);
-    }
+    if (!chatContainer) return;
 
     const messageElement = document.createElement("div");
-    const tagElement = document.createElement("strong");
-    tagElement.innerText = tag + " ";
-    messageElement.appendChild(tagElement);
-
-    const textElement = document.createElement("span");
-    textElement.innerHTML = text; // innerHTML, um <br> zu rendern
-    messageElement.appendChild(textElement);
-
+    messageElement.innerHTML = `<strong>${tag}</strong> ${text.replace(
+      /\n/g,
+      "<br>"
+    )}`;
     chatContainer.appendChild(messageElement);
     chatContainer.scrollTop = chatContainer.scrollHeight; // Auto-scroll
-
-    // Gibt das Text-Span zurück, damit es bei Bedarf aktualisiert werden kann
-    return textElement;
   },
 
   getDom() {
     const wrapper = document.createElement("div");
     wrapper.className = "MMM-OpenAIVoice";
-
-    // Prüft, ob der API-Schlüssel in der Konfiguration vorhanden ist.
-    if (!this.config.openAiKey) {
-      wrapper.innerHTML = "OpenAI API Key fehlt in der config.js!";
-      wrapper.classList.add("normal", "dimmed", "error");
-      return wrapper;
-    }
-
     const chatContainer = document.createElement("div");
     chatContainer.id = "openaivoice-chat";
-    // Startnachricht wird nur initial gesetzt
-    if (wrapper.getElementsByClassName("openaivoice-chat").length === 0) {
-      chatContainer.innerHTML = "Sag „Computer…“";
-    }
-
+    chatContainer.innerHTML = "Sag „Computer…“";
     wrapper.appendChild(chatContainer);
     return wrapper;
   },
