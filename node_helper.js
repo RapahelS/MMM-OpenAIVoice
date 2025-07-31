@@ -1,4 +1,4 @@
-// node_helper.js – Finale Version
+// node_helper.js – Finale, korrigierte Version
 "use strict";
 
 const NodeHelper = require("node_helper");
@@ -9,6 +9,7 @@ const OpenAI = require("openai");
 const SENTENCE_END_REGEX = /[.!?]\s|[\n\r]/;
 
 module.exports = NodeHelper.create({
+  // init() und socketNotificationReceived() bleiben unverändert
   init() {
     this.conv = [];
     this.prevId = undefined;
@@ -22,13 +23,10 @@ module.exports = NodeHelper.create({
     if (type === "OPENAIVOICE_INIT") {
       this.cfg = payload;
       this.debug = !!this.cfg.debug;
-
-      // Greift direkt auf den Schlüssel aus der Config zu
       if (!this.cfg.openAiKey) {
         this.error("OpenAI API Key ist nicht in der config.js gesetzt!");
         return;
       }
-
       try {
         this.openai = new OpenAI({ apiKey: this.cfg.openAiKey });
         this.log("Initialisierung erfolgreich. Modell:", this.cfg.model);
@@ -37,7 +35,6 @@ module.exports = NodeHelper.create({
       }
       return;
     }
-
     if (type === "OPENAIVOICE_PROCESS_AUDIO" && payload?.filePath) {
       if (this.isProcessing) {
         this.log(
@@ -53,6 +50,7 @@ module.exports = NodeHelper.create({
     }
   },
 
+  // handleAudioPipeline() und speechToText() bleiben unverändert
   async handleAudioPipeline(wavPath) {
     try {
       if (Date.now() - this.lastInteractionTimestamp > this.cfg.silenceMs) {
@@ -60,15 +58,12 @@ module.exports = NodeHelper.create({
         this.conv = [];
         this.prevId = undefined;
       }
-
       const userText = await this.speechToText(wavPath);
       if (!userText) {
         this.log("Kein Text erkannt.");
         return;
       }
       this.send("USER_TRANSCRIPTION", userText);
-      this.conv.push({ role: "user", content: userText });
-
       await this.processLlmAndTtsStream(userText);
     } catch (err) {
       this.error(err.message || "Ein unbekannter Fehler ist aufgetreten.");
@@ -98,10 +93,12 @@ module.exports = NodeHelper.create({
     }
   },
 
+  // KORRIGIERTE FUNKTION
   async processLlmAndTtsStream(userText) {
     this.send("BOT_START");
     const player = this.createAudioPlayer();
     let sentenceBuffer = "";
+    let fullResponseText = ""; // FIX 1: Variable zum Sammeln der Antwort
 
     try {
       const stream = await this.openai.responses.create({
@@ -117,8 +114,11 @@ module.exports = NodeHelper.create({
         if (event.type === "content.delta") {
           const delta = event.content[0].text;
           if (!delta) continue;
+
+          fullResponseText += delta; // FIX 1: Antwort hier zusammensetzen
           this.send("BOT_CHUNK", delta);
           sentenceBuffer += delta;
+
           if (SENTENCE_END_REGEX.test(sentenceBuffer)) {
             await this.streamTextToPlayer(sentenceBuffer.trim(), player);
             sentenceBuffer = "";
@@ -133,10 +133,11 @@ module.exports = NodeHelper.create({
         await this.streamTextToPlayer(sentenceBuffer.trim(), player);
       }
 
-      const fullResponse = stream.response.content[0].text;
-      this.conv.push({ role: "assistant", content: fullResponse });
+      // FIX 1: Die selbst zusammengesetzte Antwort für den Kontext verwenden
+      this.conv.push({ role: "user", content: userText });
+      this.conv.push({ role: "assistant", content: fullResponseText });
     } catch (e) {
-      this.error(`LLM/TTS Stream Fehler: ${e.status || ""} ${e.message}`);
+      this.error(`LLM/TTS Stream Fehler: ${e.message}`);
       await this.streamTextToPlayer(
         "Entschuldigung, ein Fehler ist aufgetreten.",
         player
@@ -148,6 +149,7 @@ module.exports = NodeHelper.create({
     }
   },
 
+  // KORRIGIERTE FUNKTION
   async streamTextToPlayer(text, player) {
     if (!text) return;
     this.log(`Spreche Satz: "${text}"`);
@@ -156,7 +158,8 @@ module.exports = NodeHelper.create({
         model: this.cfg.ttsModel,
         voice: this.cfg.voice,
         input: text,
-        response_format: "pcm_s16le",
+        // FIX 2: Korrektes, von der API unterstütztes Format verwenden
+        response_format: "pcm",
       });
       ttsStream.body.pipe(player.stdin, { end: false });
       await new Promise((resolve) => ttsStream.body.on("end", resolve));
@@ -165,6 +168,7 @@ module.exports = NodeHelper.create({
     }
   },
 
+  // createAudioPlayer() und Utils bleiben unverändert
   createAudioPlayer() {
     const args = [
       "-q",
