@@ -1,17 +1,21 @@
 /* eslint-env browser */
 /**
- * MMM-OpenAIVoice - Frontend
+ * MMM-OpenAIVoice - Frontend (Final)
  *
- * Optimiert für das Empfangen von Text-Chunks für eine flüssige Anzeige.
+ * - Empfängt die Trigger-Benachrichtigung von MMM-Hotword2.
+ * - Sendet den Dateipfad zur Verarbeitung an den Node Helper.
+ * - Stellt die transkribierte Nutzer-Eingabe dar.
+ * - Zeigt die Antwort des Bots flüssig an, indem es Text-Chunks verarbeitet.
  */
 Module.register("MMM-OpenAIVoice", {
   defaults: {
-    openAiKey: "", // Besser über .env im Helper-Verzeichnis setzen
-    model: "gpt-4o-mini", // Empfehlung: gpt-4o-mini ist neuer und oft schneller/günstiger
+    openAiKey: "", // Wird vom Helper benötigt
+    model: "gpt-4o-mini",
     ttsModel: "gpt-4o-mini-tts",
+    transcribeModel: "gpt-4o-mini-transcribe",
     voice: "alloy",
     playbackDevice: "default",
-    silenceMs: 15000, // Nach 15s Stille wird der Kontext zurückgesetzt
+    silenceMs: 15000,
     debug: false,
   },
 
@@ -20,28 +24,33 @@ Module.register("MMM-OpenAIVoice", {
   },
 
   start() {
-    this.chatHistory = []; // Vollständiger Verlauf für die Anzeige
-    this.currentBotResponseElement = null; // Das DOM-Element für die aktuelle Bot-Antwort
+    this.currentBotResponseElement = null;
     this.sendSocketNotification("OPENAIVOICE_INIT", this.config);
-    this.updateDom(0); // Start mit sanftem Fade-in
+    this.updateDom(0);
   },
 
+  // Empfängt die Benachrichtigung von MMM-Hotword2
   notificationReceived(notification, payload) {
-    if (notification === "OPENAIVOICE_AUDIO_WAKEWORD") {
-      // Optional: Visuelles Feedback beim Hören des Weckworts
-      const container = document.querySelector(".MMM-OpenAIVoice");
-      if (container) container.classList.add("recording");
-    }
-    if (notification === "OPENAIVOICE_AUDIO_FILE") {
+    if (notification === "OPENAIVOICE_AUDIO") {
       const container = document.querySelector(".MMM-OpenAIVoice");
       if (container) container.classList.remove("recording");
+
+      // Sendet die Benachrichtigung mit dem korrekten Namen an den Node Helper
       this.sendSocketNotification("OPENAIVOICE_PROCESS_AUDIO", payload);
+    }
+
+    if (notification === "OPENAIVOICE_ERROR") {
+      this.socketNotificationReceived("OPENAIVOICE_ERROR", payload);
     }
   },
 
+  // Empfängt Nachrichten vom Node Helper
   socketNotificationReceived(notification, payload) {
     switch (notification) {
       case "OPENAIVOICE_USER_TRANSCRIPTION":
+        // Bereinigt die UI für eine neue Konversation
+        const chatContainer = document.getElementById("openaivoice-chat");
+        if (chatContainer) chatContainer.innerHTML = "";
         this.addMessage("👤", payload);
         break;
       case "OPENAIVOICE_BOT_START":
@@ -49,11 +58,15 @@ Module.register("MMM-OpenAIVoice", {
         break;
       case "OPENAIVOICE_BOT_CHUNK":
         if (this.currentBotResponseElement) {
-          this.currentBotResponseElement.innerHTML += payload;
+          // Ersetzt Zeilenumbrüche durch HTML-Tags für die korrekte Anzeige
+          this.currentBotResponseElement.innerHTML += payload.replace(
+            /\n/g,
+            "<br>"
+          );
         }
         break;
       case "OPENAIVOICE_BOT_END":
-        this.currentBotResponseElement = null; // Nächste Nachricht wird eine neue sein
+        this.currentBotResponseElement = null; // Antwort ist fertig
         break;
       case "OPENAIVOICE_ERROR":
         this.addMessage("⚠️", payload);
@@ -61,9 +74,10 @@ Module.register("MMM-OpenAIVoice", {
     }
   },
 
+  // Fügt eine neue Nachricht zum Chat-Fenster hinzu
   addMessage(tag, text) {
     const chatContainer = document.getElementById("openaivoice-chat");
-    if (!chatContainer) return;
+    if (!chatContainer) return null;
 
     // UI-Logik, um nicht unendlich viele Nachrichten anzuzeigen
     while (chatContainer.children.length > 10) {
@@ -76,7 +90,7 @@ Module.register("MMM-OpenAIVoice", {
     messageElement.appendChild(tagElement);
 
     const textElement = document.createElement("span");
-    textElement.innerText = text;
+    textElement.innerHTML = text; // innerHTML, um <br> zu rendern
     messageElement.appendChild(textElement);
 
     chatContainer.appendChild(messageElement);
@@ -90,15 +104,19 @@ Module.register("MMM-OpenAIVoice", {
     const wrapper = document.createElement("div");
     wrapper.className = "MMM-OpenAIVoice";
 
-    if (!this.config.openAiKey && !process.env.OPENAI_API_KEY) {
-      wrapper.innerHTML = "OpenAI API Key fehlt!";
-      wrapper.classList.add("normal", "dimmed");
+    // Prüft, ob der API-Schlüssel in der Konfiguration vorhanden ist.
+    if (!this.config.openAiKey) {
+      wrapper.innerHTML = "OpenAI API Key fehlt in der config.js!";
+      wrapper.classList.add("normal", "dimmed", "error");
       return wrapper;
     }
 
     const chatContainer = document.createElement("div");
     chatContainer.id = "openaivoice-chat";
-    chatContainer.innerHTML = "Sag „Computer…“"; // Startnachricht
+    // Startnachricht wird nur initial gesetzt
+    if (wrapper.getElementsByClassName("openaivoice-chat").length === 0) {
+      chatContainer.innerHTML = "Sag „Computer…“";
+    }
 
     wrapper.appendChild(chatContainer);
     return wrapper;

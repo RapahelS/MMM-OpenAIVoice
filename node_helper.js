@@ -1,13 +1,11 @@
-// node_helper.js – Optimierte Streaming-Pipeline für MMM-OpenAIVoice
+// node_helper.js – Finale Version
 "use strict";
 
 const NodeHelper = require("node_helper");
 const fs = require("fs");
 const { spawn } = require("child_process");
 const OpenAI = require("openai");
-require("dotenv").config(); // Lädt API-Key aus .env im Helper-Verzeichnis
 
-// Einfache Satzgrenzen-Erkennung für flüssiges Streaming
 const SENTENCE_END_REGEX = /[.!?]\s|[\n\r]/;
 
 module.exports = NodeHelper.create({
@@ -24,10 +22,15 @@ module.exports = NodeHelper.create({
     if (type === "OPENAIVOICE_INIT") {
       this.cfg = payload;
       this.debug = !!this.cfg.debug;
+
+      // Greift direkt auf den Schlüssel aus der Config zu
+      if (!this.cfg.openAiKey) {
+        this.error("OpenAI API Key ist nicht in der config.js gesetzt!");
+        return;
+      }
+
       try {
-        this.openai = new OpenAI({
-          apiKey: process.env.OPENAI_API_KEY || this.cfg.openAiKey,
-        });
+        this.openai = new OpenAI({ apiKey: this.cfg.openAiKey });
         this.log("Initialisierung erfolgreich. Modell:", this.cfg.model);
       } catch (e) {
         this.error("OpenAI-Initialisierung fehlgeschlagen:", e.message);
@@ -52,14 +55,12 @@ module.exports = NodeHelper.create({
 
   async handleAudioPipeline(wavPath) {
     try {
-      // Kontext zurücksetzen, wenn zu lange nichts gesagt wurde
       if (Date.now() - this.lastInteractionTimestamp > this.cfg.silenceMs) {
         this.log("Stille-Timeout erreicht, setze Konversation zurück.");
         this.conv = [];
         this.prevId = undefined;
       }
 
-      /* 1. STT: Sprache zu Text */
       const userText = await this.speechToText(wavPath);
       if (!userText) {
         this.log("Kein Text erkannt.");
@@ -68,12 +69,10 @@ module.exports = NodeHelper.create({
       this.send("USER_TRANSCRIPTION", userText);
       this.conv.push({ role: "user", content: userText });
 
-      /* 2. & 3. ECHTE STREAMING-PIPELINE: LLM -> TTS -> Player */
       await this.processLlmAndTtsStream(userText);
     } catch (err) {
       this.error(err.message || "Ein unbekannter Fehler ist aufgetreten.");
     } finally {
-      // Aufräumen der temporären WAV-Datei
       fs.unlink(
         wavPath,
         (e) => e && this.log("Fehler beim Löschen der WAV-Datei:", e.message)
@@ -86,9 +85,12 @@ module.exports = NodeHelper.create({
     try {
       const { text } = await this.openai.audio.transcriptions.create({
         file: fs.createReadStream(path),
-        model: "gpt-4o-mini-transcribe", // Das ist die beste Wahl für schnelle Transkription
+        model: this.cfg.transcribeModel,
       });
-      this.log(`STT ⏱ ${Date.now() - t0} ms →`, text.trim());
+      this.log(
+        `STT (${this.cfg.transcribeModel}) ⏱ ${Date.now() - t0} ms →`,
+        text.trim()
+      );
       return text.trim();
     } catch (e) {
       this.error(`STT Fehler: ${e.message}`);
@@ -97,23 +99,16 @@ module.exports = NodeHelper.create({
   },
 
   async processLlmAndTtsStream(userText) {
-    this.send("BOT_START"); // Signal an UI, dass die Bot-Antwort beginnt
-
-    // Player (aplay) wird einmalig gestartet und wartet auf Audio-Daten via stdin
+    this.send("BOT_START");
     const player = this.createAudioPlayer();
-
-    // Text-Puffer für Sätze
     let sentenceBuffer = "";
 
     try {
-      // Die Responses-API ist hier die korrekte Wahl für Agenten-Logik
       const stream = await this.openai.responses.create({
         model: this.cfg.model,
-        input: userText, // Nur die letzte Eingabe senden
-        previous_response_id: this.prevId, // Den Verlauf über die ID steuern
+        input: userText,
+        previous_response_id: this.prevId,
         stream: true,
-        // Werkzeuge wie Web Search könnten hier aktiviert werden:
-        // tools: [{ type: "web_search" }],
       });
 
       this.log("Pipeline gestartet mit Responses-API.");
@@ -122,42 +117,33 @@ module.exports = NodeHelper.create({
         if (event.type === "content.delta") {
           const delta = event.content[0].text;
           if (!delta) continue;
-
-          // Sende Chunk sofort an die UI für den "Tipp-Effekt"
           this.send("BOT_CHUNK", delta);
           sentenceBuffer += delta;
-
-          // Wenn ein Satzende erreicht ist, generiere und spiele den Ton ab
           if (SENTENCE_END_REGEX.test(sentenceBuffer)) {
             await this.streamTextToPlayer(sentenceBuffer.trim(), player);
-            sentenceBuffer = ""; // Puffer für den nächsten Satz zurücksetzen
+            sentenceBuffer = "";
           }
         }
-        // Wichtig: Die neue ID für die nächste Konversationsrunde speichern
         if (event.type === "response") {
           this.prevId = event.response.id;
         }
       }
 
-      // Den restlichen Text im Puffer (falls kein Satzende am Schluss) auch noch sagen
       if (sentenceBuffer.trim()) {
         await this.streamTextToPlayer(sentenceBuffer.trim(), player);
       }
 
-      // Gesamte Bot-Antwort im Kontext für die nächste Runde speichern
       const fullResponse = stream.response.content[0].text;
       this.conv.push({ role: "assistant", content: fullResponse });
     } catch (e) {
       this.error(`LLM/TTS Stream Fehler: ${e.status || ""} ${e.message}`);
-      // Fallback-Nachricht abspielen
       await this.streamTextToPlayer(
         "Entschuldigung, ein Fehler ist aufgetreten.",
         player
       );
     } finally {
-      // Wichtig: Den Player-Prozess sauber beenden, wenn alles gesagt wurde
       player.stdin.end();
-      this.send("BOT_END"); // Signal an UI, dass die Antwort komplett ist
+      this.send("BOT_END");
       this.log("Pipeline beendet.");
     }
   },
@@ -170,14 +156,9 @@ module.exports = NodeHelper.create({
         model: this.cfg.ttsModel,
         voice: this.cfg.voice,
         input: text,
-        response_format: "pcm_s16le", // PCM ist ideal für Raspberry Pi: kein Dekodierungs-Overhead
+        response_format: "pcm_s16le",
       });
-
-      // Pipe den Audio-Stream direkt in den Player
-      // { end: false } verhindert, dass der Player nach dem ersten Satz schließt
       ttsStream.body.pipe(player.stdin, { end: false });
-
-      // Warten, bis dieser Audio-Chunk vollständig in den Player geschrieben wurde
       await new Promise((resolve) => ttsStream.body.on("end", resolve));
     } catch (e) {
       this.error(`TTS Fehler für Text "${text}": ${e.message}`);
@@ -185,20 +166,18 @@ module.exports = NodeHelper.create({
   },
 
   createAudioPlayer() {
-    // PCM-Format ist für den Pi am performantesten, da es roh ist
-    // und keine CPU-lastige Dekodierung wie bei MP3 benötigt.
     const args = [
-      "-q", // leise, keine Statusmeldungen
+      "-q",
       "-D",
-      this.cfg.playbackDevice, // Audiogerät
+      this.cfg.playbackDevice,
       "-t",
-      "raw", // Dateityp
+      "raw",
       "-f",
-      "S16_LE", // Format: Signed 16-bit Little-Endian (Standard für pcm_s16le)
+      "S16_LE",
       "-r",
-      "24000", // Abtastrate: 24kHz ist Standard für OpenAI TTS
+      "24000",
       "-c",
-      "1", // Kanäle: Mono
+      "1",
     ];
     const player = spawn("aplay", args);
     player.on("error", (err) => this.error("aplay Fehler:", err.message));
@@ -206,7 +185,6 @@ module.exports = NodeHelper.create({
     return player;
   },
 
-  /* ------------------- Utils ----------------------- */
   send(tag, txt) {
     this.sendSocketNotification(`OPENAIVOICE_${tag}`, txt);
   },
