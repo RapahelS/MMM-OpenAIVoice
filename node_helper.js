@@ -1,171 +1,220 @@
-// node_helper.js – volle Chat-/Responses-Streaming-Pipeline, robustes Logging
+// node_helper.js – Optimierte Streaming-Pipeline für MMM-OpenAIVoice
 "use strict";
-
-/**
- * MMM-OpenAIVoice · Node-Helper
- * ─────────────────────────────
- * 1. WAV von MMM-Hotword2 → STT  (gpt-4o-mini-transcribe)
- * 2. LLM-Antwort  • versucht Responses-API
- *                • Fallback Chat-Completions-Streaming
- * 3. TTS (wav oder pcm) → aplay
- * 4. Alle Events / Fehler gehen als Socket-Notify an Front-End
- */
 
 const NodeHelper = require("node_helper");
 const fs = require("fs");
 const { spawn } = require("child_process");
 const OpenAI = require("openai");
-require("dotenv").config();
+require("dotenv").config(); // Lädt API-Key aus .env im Helper-Verzeichnis
 
-const SENT_END = /[.!?]\s$/; // sehr simple Satzgrenze
+// Einfache Satzgrenzen-Erkennung für flüssiges Streaming
+const SENTENCE_END_REGEX = /[.!?]\s|[\n\r]/;
 
 module.exports = NodeHelper.create({
   init() {
-    this.conv = []; // Kontextspeicher
-    this.prevId = undefined; // für Responses-API
-    this.lastTs = 0;
+    this.conv = [];
+    this.prevId = undefined;
+    this.lastInteractionTimestamp = 0;
+    this.isProcessing = false;
+    this.cfg = {};
+    this.openai = null;
   },
 
-  /* ----------- Socket-Brücke MM ⟷ Helper ----------- */
   socketNotificationReceived(type, payload) {
     if (type === "OPENAIVOICE_INIT") {
       this.cfg = payload;
       this.debug = !!this.cfg.debug;
-      this.openai = new OpenAI({
-        apiKey: process.env.OPENAI_API_KEY || this.cfg.openAiKey,
-      });
-      this.log("Init – Modell:", this.cfg.model);
+      try {
+        this.openai = new OpenAI({
+          apiKey: process.env.OPENAI_API_KEY || this.cfg.openAiKey,
+        });
+        this.log("Initialisierung erfolgreich. Modell:", this.cfg.model);
+      } catch (e) {
+        this.error("OpenAI-Initialisierung fehlgeschlagen:", e.message);
+      }
       return;
     }
 
-    if (type === "OPENAIVOICE_AUDIO" && payload?.filePath) {
-      this.handleAudio(payload.filePath).catch((err) => this.error(err));
+    if (type === "OPENAIVOICE_PROCESS_AUDIO" && payload?.filePath) {
+      if (this.isProcessing) {
+        this.log(
+          "Ignoriere Audio, da bereits eine Anfrage in Bearbeitung ist."
+        );
+        return;
+      }
+      this.isProcessing = true;
+      this.handleAudioPipeline(payload.filePath).finally(() => {
+        this.isProcessing = false;
+        this.lastInteractionTimestamp = Date.now();
+      });
     }
   },
 
-  /* ---------------- Haupt-Pipeline ----------------- */
-  async handleAudio(wavPath) {
-    /* 1 STT */
-    const userText = await this.stt(wavPath);
-    this.send("USER", userText);
-    this.conv.push({ role: "user", content: userText });
+  async handleAudioPipeline(wavPath) {
+    try {
+      // Kontext zurücksetzen, wenn zu lange nichts gesagt wurde
+      if (Date.now() - this.lastInteractionTimestamp > this.cfg.silenceMs) {
+        this.log("Stille-Timeout erreicht, setze Konversation zurück.");
+        this.conv = [];
+        this.prevId = undefined;
+      }
 
-    /* 2 LLM-Antwort → Streaming-Text */
-    const buffer = await this.llmStream(); // gibt kompletten Antwort-String zurück
+      /* 1. STT: Sprache zu Text */
+      const userText = await this.speechToText(wavPath);
+      if (!userText) {
+        this.log("Kein Text erkannt.");
+        return;
+      }
+      this.send("USER_TRANSCRIPTION", userText);
+      this.conv.push({ role: "user", content: userText });
 
-    /* 3 TTS */
-    await this.say(buffer.trim());
-
-    /* 4 Kontext */
-    this.lastTs = Date.now();
+      /* 2. & 3. ECHTE STREAMING-PIPELINE: LLM -> TTS -> Player */
+      await this.processLlmAndTtsStream(userText);
+    } catch (err) {
+      this.error(err.message || "Ein unbekannter Fehler ist aufgetreten.");
+    } finally {
+      // Aufräumen der temporären WAV-Datei
+      fs.unlink(
+        wavPath,
+        (e) => e && this.log("Fehler beim Löschen der WAV-Datei:", e.message)
+      );
+    }
   },
 
-  /* -------------- Speech-to-Text ------------------- */
-  async stt(path) {
+  async speechToText(path) {
     const t0 = Date.now();
-    const txt = await this.openai.audio.transcriptions.create({
-      file: fs.createReadStream(path),
-      model: "gpt-4o-mini-transcribe",
-      response_format: "text",
-    });
-    this.log(`STT  ⏱ ${Date.now() - t0} ms →`, txt.trim());
-    return txt.trim();
+    try {
+      const { text } = await this.openai.audio.transcriptions.create({
+        file: fs.createReadStream(path),
+        model: "gpt-4o-mini-transcribe", // Das ist die beste Wahl für schnelle Transkription
+      });
+      this.log(`STT ⏱ ${Date.now() - t0} ms →`, text.trim());
+      return text.trim();
+    } catch (e) {
+      this.error(`STT Fehler: ${e.message}`);
+      return "";
+    }
   },
 
-  /* ------------ LLM-Streaming (Resp → Chat) -------- */
-  async llmStream() {
-    const model = this.cfg.model;
-    let stream;
-    let usingResponses = true;
+  async processLlmAndTtsStream(userText) {
+    this.send("BOT_START"); // Signal an UI, dass die Bot-Antwort beginnt
+
+    // Player (aplay) wird einmalig gestartet und wartet auf Audio-Daten via stdin
+    const player = this.createAudioPlayer();
+
+    // Text-Puffer für Sätze
+    let sentenceBuffer = "";
 
     try {
-      stream = await this.openai.responses.create({
-        model,
-        input: this.conv,
-        previous_response_id: this.prevId ?? undefined,
+      // Die Responses-API ist hier die korrekte Wahl für Agenten-Logik
+      const stream = await this.openai.responses.create({
+        model: this.cfg.model,
+        input: userText, // Nur die letzte Eingabe senden
+        previous_response_id: this.prevId, // Den Verlauf über die ID steuern
         stream: true,
-        store: false,
+        // Werkzeuge wie Web Search könnten hier aktiviert werden:
+        // tools: [{ type: "web_search" }],
       });
-      this.log("PIPE = Responses-API", model);
-    } catch (e) {
-      usingResponses = false;
-      this.log(
-        `Responses-API failed (${
-          e.status || e.message
-        }) –> fallback Chat-Completions`
-      );
-      stream = await this.openai.chat.completions.create({
-        model,
-        messages: this.conv,
-        stream: true,
-      });
-    }
 
-    /* Normalisieren des Streams */
-    const it = usingResponses
-      ? stream[Symbol.asyncIterator]() // Responses-Events liefern .content[0].text
-      : stream[Symbol.asyncIterator](); // Chat-Stream liefert choices[0].delta.content
+      this.log("Pipeline gestartet mit Responses-API.");
 
-    let buf = "";
-    for await (const chunk of it) {
-      const delta = usingResponses
-        ? chunk.content?.[0]?.text || ""
-        : chunk.choices?.[0]?.delta?.content || "";
+      for await (const event of stream) {
+        if (event.type === "content.delta") {
+          const delta = event.content[0].text;
+          if (!delta) continue;
 
-      if (!delta) continue; // leeren Chunk ignorieren
-      buf += delta;
-      this.log("CHUNK:", delta.replace(/\n/g, "↵"));
-      if (SENT_END.test(buf)) {
-        this.send("BOT", buf.trim()); // Text schon anzeigen
+          // Sende Chunk sofort an die UI für den "Tipp-Effekt"
+          this.send("BOT_CHUNK", delta);
+          sentenceBuffer += delta;
+
+          // Wenn ein Satzende erreicht ist, generiere und spiele den Ton ab
+          if (SENTENCE_END_REGEX.test(sentenceBuffer)) {
+            await this.streamTextToPlayer(sentenceBuffer.trim(), player);
+            sentenceBuffer = ""; // Puffer für den nächsten Satz zurücksetzen
+          }
+        }
+        // Wichtig: Die neue ID für die nächste Konversationsrunde speichern
+        if (event.type === "response") {
+          this.prevId = event.response.id;
+        }
       }
+
+      // Den restlichen Text im Puffer (falls kein Satzende am Schluss) auch noch sagen
+      if (sentenceBuffer.trim()) {
+        await this.streamTextToPlayer(sentenceBuffer.trim(), player);
+      }
+
+      // Gesamte Bot-Antwort im Kontext für die nächste Runde speichern
+      const fullResponse = stream.response.content[0].text;
+      this.conv.push({ role: "assistant", content: fullResponse });
+    } catch (e) {
+      this.error(`LLM/TTS Stream Fehler: ${e.status || ""} ${e.message}`);
+      // Fallback-Nachricht abspielen
+      await this.streamTextToPlayer(
+        "Entschuldigung, ein Fehler ist aufgetreten.",
+        player
+      );
+    } finally {
+      // Wichtig: Den Player-Prozess sauber beenden, wenn alles gesagt wurde
+      player.stdin.end();
+      this.send("BOT_END"); // Signal an UI, dass die Antwort komplett ist
+      this.log("Pipeline beendet.");
     }
-
-    this.prevId = usingResponses ? stream.id : undefined; // Responses speichert Thread-ID
-    this.send("BOT", buf.trim()); // finale Sicherung
-    return buf;
   },
 
-  /* ---------------- Text-to-Speech ----------------- */
-  async say(text) {
-    const t0 = Date.now();
-    const fmt = "wav"; // "pcm" → schneller, s. config-Tabelle
-    const speech = await this.openai.audio.speech.create({
-      model: this.cfg.ttsModel,
-      voice: this.cfg.voice,
-      input: text,
-      response_format: fmt,
-    });
-    const audioBuf = Buffer.from(await speech.arrayBuffer());
-    this.log(`TTS  ⏱ ${Date.now() - t0} ms · ${audioBuf.length} bytes`);
+  async streamTextToPlayer(text, player) {
+    if (!text) return;
+    this.log(`Spreche Satz: "${text}"`);
+    try {
+      const ttsStream = await this.openai.audio.speech.create({
+        model: this.cfg.ttsModel,
+        voice: this.cfg.voice,
+        input: text,
+        response_format: "pcm_s16le", // PCM ist ideal für Raspberry Pi: kein Dekodierungs-Overhead
+      });
 
-    await this.play(audioBuf, fmt);
+      // Pipe den Audio-Stream direkt in den Player
+      // { end: false } verhindert, dass der Player nach dem ersten Satz schließt
+      ttsStream.body.pipe(player.stdin, { end: false });
+
+      // Warten, bis dieser Audio-Chunk vollständig in den Player geschrieben wurde
+      await new Promise((resolve) => ttsStream.body.on("end", resolve));
+    } catch (e) {
+      this.error(`TTS Fehler für Text "${text}": ${e.message}`);
+    }
   },
 
-  play(buf, fmt) {
-    return new Promise((res, rej) => {
-      const args = [
-        "-q",
-        "-D",
-        this.cfg.playbackDevice || "default",
-        ...(fmt === "wav"
-          ? ["-t", "wav"]
-          : ["-t", "raw", "-f", "S16_LE", "-r", "24000", "-c", "1"]),
-      ];
-      const p = spawn("aplay", args);
-      p.on("close", res).on("error", rej);
-      p.stdin.end(buf);
-    });
+  createAudioPlayer() {
+    // PCM-Format ist für den Pi am performantesten, da es roh ist
+    // und keine CPU-lastige Dekodierung wie bei MP3 benötigt.
+    const args = [
+      "-q", // leise, keine Statusmeldungen
+      "-D",
+      this.cfg.playbackDevice, // Audiogerät
+      "-t",
+      "raw", // Dateityp
+      "-f",
+      "S16_LE", // Format: Signed 16-bit Little-Endian (Standard für pcm_s16le)
+      "-r",
+      "24000", // Abtastrate: 24kHz ist Standard für OpenAI TTS
+      "-c",
+      "1", // Kanäle: Mono
+    ];
+    const player = spawn("aplay", args);
+    player.on("error", (err) => this.error("aplay Fehler:", err.message));
+    player.stderr.on("data", (data) => this.error(`aplay stderr: ${data}`));
+    return player;
   },
 
   /* ------------------- Utils ----------------------- */
   send(tag, txt) {
     this.sendSocketNotification(`OPENAIVOICE_${tag}`, txt);
   },
-  log(...a) {
-    if (this.debug) console.log("[OpenAIVoice]", ...a);
+  log(...args) {
+    if (this.debug) console.log("[MMM-OpenAIVoice]", ...args);
   },
-  error(e) {
-    console.error(e);
-    this.send("ERR", e.message);
+  error(...args) {
+    console.error("[MMM-OpenAIVoice ERROR]", ...args);
+    this.send("ERROR", args[0]?.message || JSON.stringify(args[0]));
   },
 });

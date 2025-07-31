@@ -1,13 +1,18 @@
 /* eslint-env browser */
-/** Front-End für OpenAI-Voice-Assistent (Streaming). */
+/**
+ * MMM-OpenAIVoice - Frontend
+ *
+ * Optimiert für das Empfangen von Text-Chunks für eine flüssige Anzeige.
+ */
 Module.register("MMM-OpenAIVoice", {
   defaults: {
-    openAiKey: "",
-    model: "gpt-4.1",
+    openAiKey: "", // Besser über .env im Helper-Verzeichnis setzen
+    model: "gpt-4o-mini", // Empfehlung: gpt-4o-mini ist neuer und oft schneller/günstiger
     ttsModel: "gpt-4o-mini-tts",
     voice: "alloy",
     playbackDevice: "default",
-    silenceMs: 8000, // nach x ms ohne Sprache neues Weckwort nötig
+    silenceMs: 15000, // Nach 15s Stille wird der Kontext zurückgesetzt
+    debug: false,
   },
 
   getStyles() {
@@ -15,36 +20,87 @@ Module.register("MMM-OpenAIVoice", {
   },
 
   start() {
-    this.chat = [];
+    this.chatHistory = []; // Vollständiger Verlauf für die Anzeige
+    this.currentBotResponseElement = null; // Das DOM-Element für die aktuelle Bot-Antwort
     this.sendSocketNotification("OPENAIVOICE_INIT", this.config);
-    this.updateDom();
+    this.updateDom(0); // Start mit sanftem Fade-in
   },
 
-  /** WAV-Pfad von MMM-Hotword2. */
-  notificationReceived(n, p) {
-    if (n === "OPENAIVOICE_AUDIO") this.sendSocketNotification(n, p);
+  notificationReceived(notification, payload) {
+    if (notification === "OPENAIVOICE_AUDIO_WAKEWORD") {
+      // Optional: Visuelles Feedback beim Hören des Weckworts
+      const container = document.querySelector(".MMM-OpenAIVoice");
+      if (container) container.classList.add("recording");
+    }
+    if (notification === "OPENAIVOICE_AUDIO_FILE") {
+      const container = document.querySelector(".MMM-OpenAIVoice");
+      if (container) container.classList.remove("recording");
+      this.sendSocketNotification("OPENAIVOICE_PROCESS_AUDIO", payload);
+    }
   },
 
-  /** Nachrichten vom Helper → Chat-Fenster. */
-  socketNotificationReceived(n, p) {
-    const tag = { USER: "👤", BOT: "🤖", ERR: "⚠️" }[n] || "";
-    this.chat.push({ tag, txt: p });
-    if (this.chat.length > 10) this.chat.shift();
-    this.updateDom();
+  socketNotificationReceived(notification, payload) {
+    switch (notification) {
+      case "OPENAIVOICE_USER_TRANSCRIPTION":
+        this.addMessage("👤", payload);
+        break;
+      case "OPENAIVOICE_BOT_START":
+        this.currentBotResponseElement = this.addMessage("🤖", "");
+        break;
+      case "OPENAIVOICE_BOT_CHUNK":
+        if (this.currentBotResponseElement) {
+          this.currentBotResponseElement.innerHTML += payload;
+        }
+        break;
+      case "OPENAIVOICE_BOT_END":
+        this.currentBotResponseElement = null; // Nächste Nachricht wird eine neue sein
+        break;
+      case "OPENAIVOICE_ERROR":
+        this.addMessage("⚠️", payload);
+        break;
+    }
+  },
+
+  addMessage(tag, text) {
+    const chatContainer = document.getElementById("openaivoice-chat");
+    if (!chatContainer) return;
+
+    // UI-Logik, um nicht unendlich viele Nachrichten anzuzeigen
+    while (chatContainer.children.length > 10) {
+      chatContainer.removeChild(chatContainer.firstChild);
+    }
+
+    const messageElement = document.createElement("div");
+    const tagElement = document.createElement("strong");
+    tagElement.innerText = tag + " ";
+    messageElement.appendChild(tagElement);
+
+    const textElement = document.createElement("span");
+    textElement.innerText = text;
+    messageElement.appendChild(textElement);
+
+    chatContainer.appendChild(messageElement);
+    chatContainer.scrollTop = chatContainer.scrollHeight; // Auto-scroll
+
+    // Gibt das Text-Span zurück, damit es bei Bedarf aktualisiert werden kann
+    return textElement;
   },
 
   getDom() {
-    const w = document.createElement("div");
-    if (!this.chat.length) {
-      w.innerHTML = "Sag „&nbsp;Computer…“";
-      return w;
+    const wrapper = document.createElement("div");
+    wrapper.className = "MMM-OpenAIVoice";
+
+    if (!this.config.openAiKey && !process.env.OPENAI_API_KEY) {
+      wrapper.innerHTML = "OpenAI API Key fehlt!";
+      wrapper.classList.add("normal", "dimmed");
+      return wrapper;
     }
-    this.chat.forEach(({ tag, txt }) => {
-      w.insertAdjacentHTML(
-        "beforeend",
-        `<div><strong>${tag}</strong>&nbsp;${txt}</div>`
-      );
-    });
-    return w;
+
+    const chatContainer = document.createElement("div");
+    chatContainer.id = "openaivoice-chat";
+    chatContainer.innerHTML = "Sag „Computer…“"; // Startnachricht
+
+    wrapper.appendChild(chatContainer);
+    return wrapper;
   },
 });
