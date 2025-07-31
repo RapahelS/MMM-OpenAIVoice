@@ -51,16 +51,8 @@ module.exports = NodeHelper.create({
       );
       return; // früh abbrechen, sonst crasht Porcupine
     }
-    // ----- Model-Datei für Deutsch suchen ------------------------------
-    const pvBase = path.dirname(
-      require.resolve("@picovoice/porcupine-node/package.json")
-    );
-    const modelPath = path.join(
-      pvBase,
-      "lib",
-      "common",
-      "porcupine_params_de.pv"
-    );
+
+    const modelPath = path.resolve(__dirname, "models/porcupine_params_de.pv");
 
     if (!fs.existsSync(modelPath))
       throw new Error(`Modelldatei fehlt: ${modelPath}`);
