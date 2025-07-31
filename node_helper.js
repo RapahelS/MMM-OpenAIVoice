@@ -51,9 +51,27 @@ module.exports = NodeHelper.create({
       );
       return; // früh abbrechen, sonst crasht Porcupine
     }
+    // ----- Model-Datei für Deutsch suchen ------------------------------
+    const pvBase = path.dirname(
+      require.resolve("@picovoice/porcupine-node/package.json")
+    );
+    const modelPath = path.join(
+      pvBase,
+      "lib",
+      "common",
+      "porcupine_params_de.pv"
+    );
+
+    if (!fs.existsSync(modelPath))
+      throw new Error(`Modelldatei fehlt: ${modelPath}`);
 
     // Porcupine – Parameter­folge laut Node-API :contentReference[oaicite:0]{index=0}
-    this.porcupine = new Porcupine(accessKey, [kwPath], [0.5]);
+    this.porcupine = new Porcupine(
+      accessKey,
+      [kwPath],
+      [0.5], // Sensitivität
+      modelPath
+    );
 
     /* Transform-Stream leitet PCM-Frames an Porcupine */
     const porcupineStream = new Transform({
