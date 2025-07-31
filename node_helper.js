@@ -1,4 +1,4 @@
-// node_helper.js – Finale, stabile Version mit Konversations-Loop und Web-Suche
+// node_helper.js – Finale, stabile Version mit korrekter Architektur und API-Nutzung
 "use strict";
 
 const NodeHelper = require("node_helper");
@@ -11,7 +11,6 @@ module.exports = NodeHelper.create({
     this.cfg = {};
     this.openai = null;
     this.isProcessing = false;
-    // Die Responses API verwaltet den Kontext über eine ID, nicht über das Array.
     this.previousResponseId = null;
     this.conversationTimeout = null;
   },
@@ -33,9 +32,9 @@ module.exports = NodeHelper.create({
     }
 
     if (type === "OPENAIVOICE_PROCESS_AUDIO" && payload?.filePath) {
-      if (this.isProcessing) {
+      if (this.isProcessing)
         return this.log("Ignoriere Audio, Anfrage läuft bereits.");
-      }
+
       this.isProcessing = true;
       this.stopConversationTimeout();
       this.handleAudioPipeline(payload.filePath).finally(() => {
@@ -49,30 +48,18 @@ module.exports = NodeHelper.create({
       const userText = await this.speechToText(wavPath);
       if (!userText) {
         this.log("Kein Text erkannt, starte Konversations-Loop neu.");
-        this.startConversationLoop();
-        return;
+        return this.startConversationLoop();
       }
 
       this.send("USER_TRANSCRIPTION", userText);
-
-      // Wir nutzen jetzt die Responses API für intelligente Tool-Nutzung (Web-Suche)
       const botResponseText = await this.getBotResponseWithTools(userText);
-      if (!botResponseText) {
-        this.log("Keine Antwort vom Bot erhalten.");
-        this.startConversationLoop();
-        return;
-      }
 
-      // Senden der kompletten Antwort an die UI
       this.send("BOT_CHUNK", botResponseText);
-
       await this.playTextAsSpeech(botResponseText);
-
-      // Nach der Antwort des Bots, sofort wieder auf eine Nutzereingabe lauschen
       this.startConversationLoop();
     } catch (err) {
       this.error(err.message || "Unbekannter Fehler in der Pipeline.");
-      this.endConversation(); // Bei Fehler Konversation sicher beenden
+      this.endConversation();
     } finally {
       fs.unlink(
         wavPath,
@@ -82,6 +69,7 @@ module.exports = NodeHelper.create({
   },
 
   async speechToText(path) {
+    // Diese Funktion bleibt unverändert und ist bereits korrekt.
     const t0 = Date.now();
     try {
       const { text } = await this.openai.audio.transcriptions.create({
@@ -96,57 +84,86 @@ module.exports = NodeHelper.create({
     }
   },
 
-  // Umbenannt und umgestellt auf die RESPONSES API mit Web-Suche
   async getBotResponseWithTools(userText) {
     this.log("Frage an Responses API mit Web-Suche...");
     try {
       const response = await this.openai.responses.create({
-        model: this.cfg.model, // z.B. gpt-4.1-mini oder gpt-4o-mini
+        model: this.cfg.model,
         input: userText,
-        // Konversationsverlauf wird über diese ID gesteuert
         previous_response_id: this.previousResponseId,
-        // Das Modell entscheidet selbst, ob es das Tool braucht
         tools: [{ type: "web_search" }],
-        stream: false, // Wichtig: Kein Streaming für mehr Stabilität
+        stream: false,
+        store: false, // Beste Praxis: Antworten nicht unnötig speichern
       });
 
-      // Die neue ID für die nächste Runde speichern
       this.previousResponseId = response.id;
-      const text = response.content[0].text;
+      // FIX: Die korrekte Eigenschaft `output_text` verwenden.
+      const text = response.output_text;
+
+      if (!text) {
+        this.log(
+          "API hat leeren Text zurückgegeben, vermutlich weil die Anfrage unklar war."
+        );
+        return "Ich bin mir nicht sicher, wie ich darauf antworten soll. Kannst du es anders formulieren?";
+      }
 
       this.log("Antwort von Responses API erhalten:", text.trim());
       return text.trim();
     } catch (e) {
       this.error(`Fehler bei der Anfrage an die Responses API: ${e.message}`);
-      // Bei Fehler die Konversation zurücksetzen, um Folgefehler zu vermeiden
       this.previousResponseId = null;
-      return "Entschuldigung, ich habe gerade ein Problem mit meinen Werkzeugen.";
+      return "Entschuldigung, es gab ein Problem mit meinen Werkzeugen.";
     }
   },
 
   async playTextAsSpeech(text) {
-    /* ... bleibt unverändert aus der letzten Version ... */
-  },
-  playAudioBuffer(buffer) {
-    /* ... bleibt unverändert aus der letzten Version ... */
+    if (!text) return;
+    this.log(`Spiele Audio für: "${text}"`);
+    try {
+      const speech = await this.openai.audio.speech.create({
+        model: this.cfg.ttsModel,
+        voice: this.cfg.voice,
+        input: text,
+        response_format: "pcm",
+      });
+      const audioBuffer = Buffer.from(await speech.arrayBuffer());
+      await this.playAudioBuffer(audioBuffer);
+    } catch (e) {
+      this.error(`Fehler bei der TTS-Erstellung: ${e.message}`);
+    }
   },
 
-  // Konversations-Loop Logik
+  playAudioBuffer(buffer) {
+    return new Promise((resolve, reject) => {
+      const player = spawn("aplay", [
+        "-q",
+        "-D",
+        this.cfg.playbackDevice,
+        "-t",
+        "raw",
+        "-f",
+        "S16_LE",
+        "-r",
+        "24000",
+        "-c",
+        "1",
+      ]);
+      player.on("close", resolve).on("error", reject);
+      player.stdin.end(buffer);
+    });
+  },
+
   startConversationLoop() {
-    this.log("Aktiviere Mikrofon für die nächste Runde...");
-    // Hier ist this.sendNotification korrekt, da es direkt in der Klasse aufgerufen wird
-    this.sendNotification("HOTWORD_ACTIVATE", { asDetected: "COMPUTER" });
+    this.log("Sende Anfrage an Frontend, um Mikrofon zu aktivieren...");
+    // FIX: Sendet Socket-Nachricht an das Frontend. Das ist der korrekte Weg.
+    this.sendSocketNotification("HOTWORD_CONTROL", { action: "ACTIVATE" });
     this.startConversationTimeout();
   },
 
   startConversationTimeout() {
     this.stopConversationTimeout();
-    this.log(
-      `Konversation wird in ${
-        this.cfg.silenceMs / 1000
-      }s beendet, wenn nichts gesagt wird.`
-    );
-    // FIX: Eine Arrow-Function `() => {}` verwenden, um den 'this'-Kontext zu erhalten.
+    this.log(`Konversation wird in ${this.cfg.silenceMs / 1000}s beendet.`);
+    // FIX: Arrow-Function `() => {}` erhält den 'this'-Kontext korrekt.
     this.conversationTimeout = setTimeout(() => {
       this.endConversation();
     }, this.cfg.silenceMs);
@@ -158,15 +175,13 @@ module.exports = NodeHelper.create({
   },
 
   endConversation() {
-    this.log("Konversation beendet. Warte auf neues Weckwort.");
-    // Hier war der Fehler: this.sendNotification ist jetzt im korrekten Kontext
-    this.sendNotification("HOTWORD_DEACTIVATE");
-    // Konversationsverlauf für die API zurücksetzen
+    this.log("Sende Anfrage an Frontend, um Mikrofon zu deaktivieren.");
+    // FIX: Sendet Socket-Nachricht an das Frontend.
+    this.sendSocketNotification("HOTWORD_CONTROL", { action: "DEACTIVATE" });
     this.previousResponseId = null;
     this.send("CONVERSATION_END");
   },
 
-  // Utils
   send(tag, txt) {
     this.sendSocketNotification(`OPENAIVOICE_${tag}`, txt);
   },
@@ -174,7 +189,7 @@ module.exports = NodeHelper.create({
     if (this.debug) console.log("[MMM-OpenAIVoice]", ...args);
   },
   error(...args) {
-    console.error("[MMM-OpenAIVoice ERROR]", ...args);
+    console.error("[MMM-OpenAIVoce ERROR]", ...args);
     this.send("ERROR", args[0]?.message || JSON.stringify(args[0]));
   },
 });
