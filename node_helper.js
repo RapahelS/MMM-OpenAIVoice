@@ -1,124 +1,49 @@
 "use strict";
 /**
- * Node-Helper für MMM-OpenAIVoice.
- * Wake-Word, Aufnahme, STT→LLM→TTS-Pipeline.
+ * Node-Helper: STT → LLM → TTS.
+ * Erwartet WAV-Pfad aus MMM-Hotword2.
  */
 
 const NodeHelper = require("node_helper");
 const fs = require("fs");
-const path = require("path");
 const { spawn } = require("child_process");
-const record = require("node-record-lpcm16");
-const { Transform } = require("stream");
-const { Porcupine } = require("@picovoice/porcupine-node");
-require("dotenv").config();
 const OpenAI = require("openai");
+require("dotenv").config();
 
 module.exports = NodeHelper.create({
-  porcupine: null,
   busy: false,
   openai: null,
+  cfg: {},
 
-  // -------------------------------------------------- Init aus Front-End
-  socketNotificationReceived(notification, cfg) {
-    if (notification !== "OPENAIVOICE_INIT") return;
-    this.cfg = cfg;
-    this.openai = new OpenAI({
-      apiKey: process.env.OPENAI_API_KEY || cfg.openAiKey,
-    });
-    this.initWakeWord();
-  },
-
-  // -------------------------------------------------- Wake-Word-Initialisierung
-  initWakeWord() {
-    const accessKey =
-      process.env.PORCUPINE_ACCESS_KEY || this.cfg.porcupineAccessKey;
-
-    /*
-     * Pfad-Auflösung:
-     *   – absoluter Pfad bleibt unverändert
-     *   – sonst relativ zum MagicMirror-Haupt­verzeichnis (process.cwd())
-     *     → vermeidet Dopplungen wie “…MMM-OpenAIVoice/modules/MMM-OpenAIVoice/…”
-     */
-    const kwPath = path.isAbsolute(this.cfg.wakeWord)
-      ? this.cfg.wakeWord
-      : path.resolve(process.cwd(), this.cfg.wakeWord);
-
-    if (!fs.existsSync(kwPath)) {
-      this.sendSocketNotification(
-        "OPENAIVOICE_ERROR",
-        `Wake-Word-Datei nicht gefunden: ${kwPath}`
-      );
-      return; // früh abbrechen, sonst crasht Porcupine
+  /** Init von Front-End. */
+  socketNotificationReceived(notification, payload) {
+    if (notification === "OPENAIVOICE_INIT") {
+      this.cfg = payload;
+      /* Umgebungsvariable schlägt Konfig-Key. */
+      this.openai = new OpenAI({
+        apiKey: process.env.OPENAI_API_KEY || this.cfg.openAiKey,
+      });
+      return;
     }
 
-    const modelPath = path.resolve(__dirname, "models/porcupine_params_de.pv");
-
-    if (!fs.existsSync(modelPath))
-      throw new Error(`Modelldatei fehlt: ${modelPath}`);
-
-    // Porcupine – Parameter­folge laut Node-API :contentReference[oaicite:0]{index=0}
-    this.porcupine = new Porcupine(
-      accessKey,
-      [kwPath],
-      [0.5], // Sensitivität
-      modelPath
-    );
-
-    /* Transform-Stream leitet PCM-Frames an Porcupine */
-    const porcupineStream = new Transform({
-      readableObjectMode: true,
-      transform: (chunk, _enc, cb) => {
-        const keywordIndex = this.porcupine.process(chunk);
-        if (keywordIndex >= 0) this.startRecording();
-        cb(null, chunk);
-      },
-    });
-
-    record
-      .start({
-        sampleRateHertz: 16000,
-        threshold: 0,
-        recordProgram: this.cfg.recordProgram,
-        device: this.cfg.alsaDevice ?? undefined,
-      })
-      .pipe(porcupineStream);
-  },
-
-  // -------------------------------------------------- Aufnahme
-  startRecording() {
-    if (this.busy) return;
-    this.busy = true;
-
-    const file = path.join(__dirname, "temp.wav");
-    const rec = record.start({
-      endOnSilence: true,
-      silence: "1.0",
-      sampleRateHertz: 16000,
-      threshold: 0,
-      recordProgram: this.cfg.recordProgram,
-      device: this.cfg.alsaDevice ?? undefined,
-    });
-
-    rec.pipe(fs.createWriteStream(file));
-
-    const finalize = () => {
-      record.stop();
-      this.handleAudio(file)
+    if (notification === "OPENAIVOICE_AUDIO" && payload?.filePath) {
+      if (this.busy) {
+        this.sendSocketNotification(
+          "OPENAIVOICE_ERROR",
+          "Assistent beschäftigt – bitte kurz warten."
+        );
+        return;
+      }
+      this.busy = true;
+      this.handleAudio(payload.filePath)
         .catch((err) =>
           this.sendSocketNotification("OPENAIVOICE_ERROR", String(err))
         )
-        .finally(() => {
-          fs.unlink(file, () => {});
-          setTimeout(() => (this.busy = false), 500);
-        });
-    };
-
-    setTimeout(finalize, this.cfg.maxRecordSeconds * 1000);
-    rec.once("end", finalize);
+        .finally(() => (this.busy = false));
+    }
   },
 
-  // -------------------------------------------------- STT → LLM → TTS
+  // ---------- Haupt-Pipeline ----------
   async handleAudio(file) {
     // --- Speech-to-Text
     let transcript;
@@ -131,7 +56,7 @@ module.exports = NodeHelper.create({
     } catch {
       transcript = await this.openai.audio.transcriptions.create({
         file: fs.createReadStream(file),
-        model: "whisper-1", // Fallback
+        model: "whisper-1",
       });
     }
     this.sendSocketNotification("OPENAIVOICE_TRANSCRIPTION", transcript);
@@ -142,7 +67,8 @@ module.exports = NodeHelper.create({
       messages: [
         {
           role: "system",
-          content: "Du bist ein hilfreicher Spiegel-Assistent.",
+          content:
+            "Du bist ein hilfreich-knapper Spiegel-Assistent und antwortest in natürlichem Deutsch.",
         },
         { role: "user", content: transcript },
       ],
@@ -160,7 +86,7 @@ module.exports = NodeHelper.create({
       });
     } catch {
       speech = await this.openai.audio.speech.create({
-        model: "tts-1", // Fallback
+        model: "tts-1",
         voice: this.cfg.voice,
         input: answer,
         format: "wav",
@@ -171,7 +97,7 @@ module.exports = NodeHelper.create({
     this.sendSocketNotification("OPENAIVOICE_RESPONSE", answer);
   },
 
-  // -------------------------------------------------- Wiedergabe
+  // ---------- Wiedergabe ----------
   playAudio(buffer) {
     return new Promise((resolve, reject) => {
       const dev = this.cfg.playbackDevice || "default";

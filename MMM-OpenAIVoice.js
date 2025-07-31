@@ -1,38 +1,40 @@
 /* eslint-env browser */
 /**
- * MagicMirror-Modul: OpenAI-Voice-Assistant.
- * Ultrakurze Google-Style-Docstrings, PEP 8-ähnliche Namenskonvention für Konsistenz.
+ * MagicMirror-Modul: OpenAI-Voice-Assistant (Chained).
+ * Kurz-Docstrings, PEP 8-ähnliche Benennung.
  * @module MMM-OpenAIVoice
  */
-
 Module.register("MMM-OpenAIVoice", {
   // ---------- Standard-Konfiguration ----------
   defaults: {
-    wakeWord: "assets/Hey-Spiegel_de_raspberry-pi_v3_0_0.ppn",
-    porcupineAccessKey: "",
     openAiKey: "",
     openAiModel: "gpt-4o-mini",
-    transcribeModel: "gpt-4o-mini-transcribe", // Fallback siehe helper
-    ttsModel: "gpt-4o-mini-tts", // Fallback siehe helper
+    transcribeModel: "gpt-4o-mini-transcribe",
+    ttsModel: "gpt-4o-mini-tts",
     voice: "alloy",
-    maxRecordSeconds: 10,
-    recordProgram: "arecord",
-    alsaDevice: null,
+    playbackDevice: "default", // aplay -L
   },
 
-  /** Liefert Modul-CSS. */
+  /** Modul-CSS. */
   getStyles() {
     return ["MMM-OpenAIVoice.css"];
   },
 
-  /** Initialisiert das Modul. */
+  /** Modul-Start. */
   start() {
     this.conversation = [];
-    this.updateDom(); // UI sofort
+    this.updateDom();
     this.sendSocketNotification("OPENAIVOICE_INIT", this.config);
   },
 
-  /** Verarbeitet Nachrichten vom Node-Helper. */
+  /** Receive global notifications (z. B. von MMM-Hotword2). */
+  notificationReceived(notification, payload) {
+    if (notification === "OPENAIVOICE_AUDIO" && payload?.filePath) {
+      this.sendSocketNotification("OPENAIVOICE_AUDIO", payload);
+    }
+  },
+
+  /** Receive replies from node_helper. */
   socketNotificationReceived(notification, payload) {
     const map = {
       OPENAIVOICE_TRANSCRIPTION: "👤",
@@ -43,8 +45,8 @@ Module.register("MMM-OpenAIVoice", {
   },
 
   /**
-   * Fügt neue Chatzeile hinzu.
-   * @param {string} speaker Emoji/Icon.
+   * Zeile anhängen.
+   * @param {string} speaker Emoji.
    * @param {string} text    Inhalt.
    */
   addChat(speaker, text) {
@@ -53,7 +55,7 @@ Module.register("MMM-OpenAIVoice", {
     this.updateDom();
   },
 
-  /** Baut DOM-Baum. */
+  /** DOM erzeugen. */
   getDom() {
     const w = document.createElement("div");
     if (!this.conversation.length) {

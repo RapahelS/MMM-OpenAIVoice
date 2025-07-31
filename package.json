@@ -1,18 +1,16 @@
 {
     "name": "mmm-openai-voice",
-    "version": "1.0.0",
-    "description": "MagicMirror voice assistant using OpenAI STT/LLM/TTS",
+    "version": "1.1.0",
+    "description": "MagicMirror voice assistant using OpenAI STT/LLM/TTS (chained)",
     "main": "MMM-OpenAIVoice.js",
     "scripts": {
-        "lint": "eslint",
-        "lint:fix": "eslint --fix"
+        "lint": "eslint .",
+        "lint:fix": "eslint --fix ."
     },
     "author": "[Your Name]",
     "license": "MIT",
     "dependencies": {
-        "@picovoice/porcupine-node": "^3.0.0",
         "dotenv": "^16.4.1",
-        "node-record-lpcm16": "^1.0.1",
         "openai": "^4.33.0"
     },
     "devDependencies": {
